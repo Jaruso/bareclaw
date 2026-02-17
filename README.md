@@ -1,0 +1,459 @@
+# BareClaw 🐻
+
+A fast, self-hostable AI agent runtime written in Zig. BareClaw has zero dependencies beyond the Zig standard library, small binary, runs anywhere from your dev machine to a Raspberry Pi.
+
+> **Theme**: a pragmatic, hardware-savvy bear who guards your workspace — claws out, no compromises.
+
+---
+
+## Table of Contents
+
+- [ADHD: Agent Driven Hyper Development](#adhd-agent-driven-hyper-development)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Providers](#providers)
+- [Tools](#tools)
+- [Channels](#channels)
+- [Memory](#memory)
+- [Security](#security)
+- [Cron](#cron)
+- [Gateway & Daemon](#gateway--daemon)
+- [Architecture](#architecture)
+
+---
+
+## ADHD: Agent Driven Hyper Development
+
+BareClaw is built around a core design principle: **ADHD — Agent Driven Hyper Development**.
+
+The idea is that agents should be able to build, test, run, and iterate on BareClaw itself — as fast as possible, with zero friction — using BareClaw's own MCP server as the development harness.
+
+```
+read source → edit → build() → test() → run_agent() → inspect → iterate
+     ↑                                                                ↓
+     └───────────────── tight feedback loop, all in one session ──────┘
+```
+
+The MCP server (`mcp/`) is the **primary development interface**. It wraps the entire BareClaw CLI and build system as MCP tools so any agent (Claude Desktop, Claude Code, or a BareClaw agent itself) can:
+
+- Read and understand the Zig source
+- Edit code and compile immediately
+- Run the full test suite
+- Send prompts to the live agent and inspect side effects
+- Close the loop — all without leaving the conversation
+
+**BareClaw agents can improve BareClaw.** A session running via Telegram or Discord can reason about and propose changes to its own Zig source — the same MCP tools the developer uses are available to any sufficiently capable agent.
+
+See [`docs/mcp-development.md`](docs/mcp-development.md) for the full ADHD playbook and [`mcp/README.md`](mcp/README.md) for setup.
+
+---
+
+## Features
+
+| Area | What's implemented |
+|---|---|
+| **Providers** | Anthropic (Claude), OpenAI, OpenAI-compatible, Ollama, OpenRouter, Echo (offline) |
+| **Routing** | Fallback chain — tries providers in order, returns first success |
+| **Tools** | shell, file_read, file_write, memory_store, memory_recall, memory_forget, http_request, git_operations |
+| **Agent loop** | Multi-round tool-calling with configurable max rounds (default 8) |
+| **Channels** | CLI (single-turn & interactive loop), Discord (WebSocket Gateway), Telegram (long-polling) |
+| **Memory** | Markdown file-per-key store under `~/.bareclaw/workspace/memory/` |
+| **Security** | Path allowlisting, shell command blocklist, append-only audit log |
+| **Cron** | Persistent task scheduler with TSV storage, pause/resume, manual run |
+| **Gateway** | Minimal HTTP server (`/health`, `/webhook`) |
+| **Daemon** | Gateway + cron runner combined |
+| **Migration** | Import from OpenClaw workspace |
+
+---
+
+## Quick Start
+
+**Requirements**: Zig 0.14+
+
+```bash
+# Clone and build
+git clone <your-repo-url> bareclaw
+cd bareclaw
+zig build
+
+# First-run setup
+./zig-out/bin/bareclaw onboard
+
+# Check status
+./zig-out/bin/bareclaw status
+
+# Run health diagnostics
+./zig-out/bin/bareclaw doctor
+
+# Chat with the agent
+./zig-out/bin/bareclaw agent "What files are in my workspace?"
+
+# Run tests
+zig build test
+```
+
+### Setting your API key
+
+BareClaw checks these environment variables in order:
+
+```bash
+export BARECLAW_API_KEY="your-key-here"   # preferred
+export API_KEY="your-key-here"            # generic fallback
+```
+
+Without a key, BareClaw runs in **echo mode** — it reflects your input back as the reply, which is useful for testing tools and channels without an API.
+
+---
+
+## Configuration
+
+Config lives at `~/.bareclaw/config.toml`. Run `bareclaw onboard` to create it, or edit it directly:
+
+```toml
+default_provider   = "anthropic"
+default_model      = "claude-opus-4-5"
+memory_backend     = "markdown"
+fallback_providers = "openai,ollama"
+
+# Optional channel tokens
+discord_token  = "Bot.token.here"
+telegram_token = "1234567890:your-telegram-token"
+```
+
+Tokens for Discord and Telegram can also be set via environment variables — those take precedence over the config file:
+
+```bash
+export DISCORD_BOT_TOKEN="Bot.token.here"
+export TELEGRAM_BOT_TOKEN="1234567890:your-telegram-token"
+```
+
+---
+
+## Commands
+
+```
+bareclaw <command> [options]
+```
+
+| Command | Description |
+|---|---|
+| `onboard` | Interactive first-run setup, writes config.toml |
+| `status` | Print workspace, provider, model, memory count, cron count |
+| `doctor` | Health-check all subsystems and report issues |
+| `agent "<prompt>"` | Run a single agent turn with tool-calling support |
+| `channel` | Start CLI channel (single turn) |
+| `channel loop` | Start interactive CLI REPL |
+| `channel discord` | Connect to Discord via Gateway WebSocket |
+| `channel telegram` | Start Telegram long-poll loop |
+| `cron list` | List all scheduled tasks |
+| `cron add "<schedule>" "<command>"` | Add a new cron task |
+| `cron remove <id>` | Delete a task |
+| `cron pause <id>` | Disable a task without deleting it |
+| `cron resume <id>` | Re-enable a paused task |
+| `cron run` | Execute all enabled tasks immediately |
+| `gateway` | Start HTTP gateway on port 8080 |
+| `daemon` | Start gateway + cron runner together |
+| `peripheral` | List configured hardware peripherals |
+| `migrate` | Import workspace from OpenClaw (`~/.openclaw/workspace`) |
+
+---
+
+## Providers
+
+BareClaw supports multiple AI backends. Set `default_provider` in config or use the fallback chain.
+
+### Anthropic (Claude)
+
+```toml
+default_provider = "anthropic"
+default_model    = "claude-opus-4-5"
+```
+
+```bash
+export BARECLAW_API_KEY="sk-ant-..."
+```
+
+Uses the native Anthropic Messages API (`POST /v1/messages`). Tool-use blocks (`tool_use`) are automatically translated to the internal OpenAI-compatible format so the agent loop works identically regardless of backend.
+
+### OpenAI
+
+```toml
+default_provider = "openai"
+default_model    = "gpt-4o"
+```
+
+```bash
+export BARECLAW_API_KEY="sk-..."
+```
+
+### OpenAI-Compatible (any clone)
+
+```toml
+default_provider = "openai-compatible"
+default_model    = "your-model-name"
+```
+
+```bash
+export BARECLAW_API_KEY="your-key"
+export BARECLAW_API_URL="https://your-openai-clone.example.com"
+```
+
+### Ollama (local, no key required)
+
+```toml
+default_provider = "ollama"
+default_model    = "llama3"
+```
+
+Connects to `http://localhost:11434` by default. No API key needed.
+
+### OpenRouter
+
+```toml
+default_provider = "openrouter"
+default_model    = "anthropic/claude-opus-4-5"
+```
+
+```bash
+export BARECLAW_API_KEY="sk-or-..."
+```
+
+### Echo (offline / testing)
+
+```toml
+default_provider = "echo"
+```
+
+Reflects the user message back as the reply. No network calls. Useful for testing tools, channels, and cron without an API key.
+
+### Fallback / Router
+
+Configure a comma-separated fallback chain. BareClaw tries each provider in order and returns the first successful response:
+
+```toml
+default_provider   = "anthropic"
+fallback_providers = "openai,ollama,echo"
+```
+
+---
+
+## Tools
+
+The agent can call any of these tools during a conversation. Tools are executed with the real security policy and memory context.
+
+| Tool | Description | Key Arguments |
+|---|---|---|
+| `shell` | Run a shell command via `/bin/sh -c` | `command` |
+| `file_read` | Read a file from the workspace | `path` |
+| `file_write` | Write content to a file in the workspace | `path`, `content` |
+| `memory_store` | Persist a value to the memory backend | `key`, `content` |
+| `memory_recall` | Retrieve a stored value | `key` |
+| `memory_forget` | Delete a stored memory entry | `key` |
+| `http_request` | Make a GET or POST HTTP request | `url`, `method`, `body` |
+| `git_operations` | Run git subcommands in a workspace path | `op`, `path`, `args` |
+
+**Allowed git operations**: `status`, `log`, `diff`, `add`, `commit`, `push`, `pull`, `clone`, `init`, `branch`, `checkout`, `fetch`, `stash`
+
+All tool calls are logged to the audit log before execution.
+
+---
+
+## Channels
+
+Channels are the interfaces through which users (or bots) interact with BareClaw.
+
+### CLI — Single Turn
+
+```bash
+bareclaw channel
+```
+
+Prompts for one line of input, runs the agent, prints the reply, exits.
+
+### CLI — Interactive Loop
+
+```bash
+bareclaw channel loop
+```
+
+A full REPL. Type messages, get replies. Type `exit` or `quit` to stop.
+
+### Discord
+
+```bash
+export DISCORD_BOT_TOKEN="Bot.your.token"
+bareclaw channel discord
+```
+
+Connects to the Discord Gateway via WebSocket (TLS). Listens for `MESSAGE_CREATE` events and replies to every non-bot message in-channel. Handles heartbeats, reconnection, and pong frames automatically.
+
+**Setup**:
+1. Create a bot at [discord.com/developers](https://discord.com/developers)
+2. Enable the **Message Content Intent** under Privileged Gateway Intents
+3. Invite the bot to your server with `Send Messages` permission
+4. Set `DISCORD_BOT_TOKEN` and run
+
+### Telegram
+
+```bash
+export TELEGRAM_BOT_TOKEN="1234567890:your-token"
+bareclaw channel telegram
+```
+
+Long-polls `getUpdates` (30-second timeout). Processes each text message through the agent and replies via `sendMessage`. Automatically advances the update offset to avoid duplicates.
+
+**Setup**:
+1. Message [@BotFather](https://t.me/BotFather) on Telegram to create a bot
+2. Copy the token and set `TELEGRAM_BOT_TOKEN`
+3. Run `bareclaw channel telegram`
+
+---
+
+## Memory
+
+BareClaw stores persistent memory as Markdown files under `~/.bareclaw/workspace/memory/`.
+
+Each `memory_store` call writes `<key>.md`. `memory_recall` reads it back. `memory_forget` deletes it.
+
+The agent automatically stores the last user message as `last_message` after each successful turn.
+
+```bash
+# View your memory files directly
+ls ~/.bareclaw/workspace/memory/
+```
+
+The `status` command shows a count of stored memory files.
+
+---
+
+## Security
+
+BareClaw enforces a layered security model:
+
+### Path Policy
+
+`file_read`, `file_write`, and `git_operations` all validate paths before execution:
+
+- **Directory traversal blocked**: any path containing `..` is rejected
+- **Forbidden system paths**: `/etc/`, `/root/`, `/usr/`, `/proc/`, `/sys/`, `/dev/` are always blocked
+- **Sensitive directories blocked**: paths containing `/.ssh`, `/.gnupg`, `/.aws`, or `/.bareclaw/secrets` are rejected
+- **Absolute paths**: must be inside `workspace_dir`
+- **Relative paths**: allowed (resolved relative to workspace)
+
+### Shell Command Blocklist
+
+The `shell` tool blocks a set of destructive command patterns before execution (e.g. `rm -rf`, `mkfs`, `dd if=`, `:(){ :|:& };:`). This is a defense-in-depth layer — it is not a sandbox. Full sandboxing requires OS-level isolation.
+
+### Audit Log
+
+Every tool call is appended to `~/.bareclaw/workspace/audit.log` before execution:
+
+```
+1700000000	shell	ls -la
+1700000001	file_read	notes.md
+1700000002	memory_store	last_message
+```
+
+Format: `unix_timestamp TAB tool_name TAB detail`
+
+---
+
+## Cron
+
+BareClaw includes a lightweight task scheduler. Tasks are persisted as a TSV file at `~/.bareclaw/cron.tsv`.
+
+```bash
+# Add a task (schedule field is stored but not yet parsed for time-based firing)
+bareclaw cron add "0 9 * * *" "echo good morning"
+
+# List all tasks
+bareclaw cron list
+
+# Pause / resume
+bareclaw cron pause <id>
+bareclaw cron resume <id>
+
+# Run all enabled tasks right now
+bareclaw cron run
+
+# Remove a task
+bareclaw cron remove <id>
+```
+
+The `daemon` command runs `cron run` alongside the HTTP gateway so tasks execute on daemon startup. Time-based scheduling (cron expression parsing) is on the roadmap.
+
+---
+
+## Gateway & Daemon
+
+### Gateway
+
+```bash
+bareclaw gateway
+```
+
+Starts a minimal HTTP server on `127.0.0.1:8080`:
+
+| Endpoint | Method | Response |
+|---|---|---|
+| `/health` | GET | `{"status":"ok","service":"bareclaw"}` |
+| `/webhook` | POST | `{"received":true}` |
+
+### Daemon
+
+```bash
+bareclaw daemon
+```
+
+Runs the gateway and cron runner together. Intended as a long-running background process for server deployments.
+
+---
+
+## Architecture
+
+```
+bareclaw/
+├── src/
+│   ├── main.zig          # CLI entry point, command dispatch
+│   ├── agent.zig         # Tool-calling agent loop (up to 8 rounds)
+│   ├── provider.zig      # Provider backends + Router + AnyProvider vtable
+│   ├── tools.zig         # 8 built-in tools (shell, file I/O, memory, HTTP, git)
+│   ├── channels.zig      # CLI, Discord, Telegram channel implementations
+│   ├── memory.zig        # Markdown file-per-key memory backend
+│   ├── security.zig      # Path policy, shell blocklist, audit logging
+│   ├── config.zig        # TOML config loader, defaults, onboard
+│   ├── cron.zig          # Task scheduler with TSV persistence
+│   ├── gateway.zig       # Minimal TCP/HTTP server
+│   ├── daemon.zig        # Gateway + cron combined runner
+│   ├── peripherals.zig   # Hardware peripheral listing (stub)
+│   └── migration.zig     # OpenClaw workspace importer
+└── build.zig             # Zig build system
+```
+
+**No external dependencies** — BareClaw uses only the Zig standard library. TLS (for Discord WebSocket and HTTPS), HTTP, JSON parsing, and crypto are all stdlib.
+
+### How the Agent Loop Works
+
+1. User message is sent to the configured provider
+2. If the response contains `tool_calls`, each tool is dispatched with a real `ToolContext` (policy + memory)
+3. Tool results are appended to a context buffer and fed back to the model as a follow-up turn
+4. This repeats up to 8 rounds (`MAX_TOOL_ROUNDS`)
+5. When the model produces a plain text response (no tool calls), it is printed and the turn ends
+
+The Anthropic `tool_use` block format is translated to the internal OpenAI `tool_calls` format transparently, so the agent loop is provider-agnostic.
+
+---
+
+## Roadmap
+
+- [ ] Cron expression parsing (time-based firing)
+- [ ] Structured JSON logging / observability
+- [ ] Per-provider cost tracking
+- [ ] Hardware peripheral I/O (GPIO, serial bridge for microcontrollers)
+- [ ] launchd / systemd service files for daemon mode
+- [ ] Multi-turn conversation history (beyond single-turn tool context)
+- [ ] Vector memory backend
+
+---

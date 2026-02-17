@@ -1,0 +1,319 @@
+const std = @import("std");
+
+const config_mod = @import("config.zig");
+const agent_mod = @import("agent.zig");
+const provider_mod = @import("provider.zig");
+const memory_mod = @import("memory.zig");
+const tools_mod = @import("tools.zig");
+const security_mod = @import("security.zig");
+const gateway_mod = @import("gateway.zig");
+const daemon_mod = @import("daemon.zig");
+const cron_mod = @import("cron.zig");
+const channels_mod = @import("channels.zig");
+const peripherals_mod = @import("peripherals.zig");
+const migration_mod = @import("migration.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var stdout = std.io.getStdOut().writer();
+
+    if (args.len <= 1) {
+        try stdout.print("BareClaw – zero-compromise AI claws, bear edition.\n", .{});
+        try stdout.print("Usage: {s} [--api-key <key>] <command> [options]\n", .{args[0]});
+        try stdout.print("Commands: onboard | agent | status | doctor | config | gateway | daemon | cron | channel | peripheral | migrate\n", .{});
+        return;
+    }
+
+    var cfg = try config_mod.loadOrInit(allocator);
+    defer cfg.deinit(allocator);
+
+    // Parse --api-key <value> anywhere before the command, override cfg.api_key.
+    var cmd_idx: usize = 1;
+    while (cmd_idx < args.len) {
+        if (std.mem.eql(u8, args[cmd_idx], "--api-key") and cmd_idx + 1 < args.len) {
+            allocator.free(cfg.api_key);
+            cfg.api_key = try allocator.dupe(u8, args[cmd_idx + 1]);
+            cmd_idx += 2;
+        } else {
+            break;
+        }
+    }
+    if (cmd_idx >= args.len) {
+        try stdout.print("BareClaw – no command given.\n", .{});
+        return;
+    }
+    const cmd = args[cmd_idx];
+
+    if (std.mem.eql(u8, cmd, "status")) {
+        try printStatus(allocator, &cfg, stdout);
+        return;
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        try runDoctor(allocator, &cfg, stdout);
+        return;
+    } else if (std.mem.eql(u8, cmd, "onboard")) {
+        try config_mod.quickOnboard(&cfg, allocator, stdout);
+        cfg.save() catch {};
+        return;
+    } else if (std.mem.eql(u8, cmd, "agent")) {
+        // Build provider: use router if fallback_providers is set, else single.
+        var single_provider: provider_mod.Provider = undefined;
+        var router:          provider_mod.Router   = undefined;
+        var use_router = false;
+
+        const any_provider: provider_mod.AnyProvider = blk: {
+            if (cfg.fallback_providers.len > 0) {
+                // Split "anthropic,openai,ollama" into a slice of names.
+                var names = std.ArrayList([]const u8).init(allocator);
+                defer names.deinit();
+                // Always prepend the default provider.
+                try names.append(cfg.default_provider);
+                var it = std.mem.splitScalar(u8, cfg.fallback_providers, ',');
+                while (it.next()) |n| {
+                    const trimmed = std.mem.trim(u8, n, " \t");
+                    if (trimmed.len > 0) try names.append(trimmed);
+                }
+                router = try provider_mod.createRouterWithKey(allocator, names.items, cfg.api_key);
+                use_router = true;
+                break :blk provider_mod.AnyProvider.fromRouter(&router);
+            } else {
+                single_provider = try provider_mod.createDefaultProvider(allocator, &cfg);
+                break :blk provider_mod.AnyProvider.fromProvider(&single_provider);
+            }
+        };
+        defer if (use_router) router.deinit() else single_provider.deinit();
+
+        var mem_backend = try memory_mod.createMemoryBackend(allocator, &cfg);
+        defer mem_backend.deinit();
+
+        var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
+        defer policy.deinit(allocator);
+
+        const tool_registry = try tools_mod.buildCoreTools(allocator, &policy, &mem_backend);
+        defer tools_mod.freeTools(allocator, tool_registry);
+
+        const input = if (args.len > 2)
+            args[2]
+        else
+            "Hello from BareClaw. How can you help me today?";
+
+        try agent_mod.runAgentOnce(
+            allocator,
+            &cfg,
+            any_provider,
+            &mem_backend,
+            tool_registry,
+            &policy,
+            input,
+        );
+        return;
+    } else if (std.mem.eql(u8, cmd, "gateway")) {
+        const port: u16 = 8080;
+        try gateway_mod.runGateway(port);
+        return;
+    } else if (std.mem.eql(u8, cmd, "daemon")) {
+        const port: u16 = 8080;
+        try daemon_mod.runDaemon(allocator, port);
+        return;
+    } else if (std.mem.eql(u8, cmd, "cron")) {
+        // Pass remaining args after "cron" as subcommand + params.
+        const cron_args = if (args.len > 2) args[2..] else &[_][]const u8{};
+        try cron_mod.dispatchCron(allocator, cron_args);
+        return;
+    } else if (std.mem.eql(u8, cmd, "channel")) {
+        // Subcommands: cli (default), discord, telegram, loop
+        const sub = if (args.len > 2) args[2] else "cli";
+        if (std.mem.eql(u8, sub, "discord")) {
+            try channels_mod.runDiscordChannel(&cfg);
+        } else if (std.mem.eql(u8, sub, "telegram")) {
+            try channels_mod.runTelegramChannel(&cfg);
+        } else if (std.mem.eql(u8, sub, "loop")) {
+            try channels_mod.runCliChannelLoop(&cfg);
+        } else {
+            try channels_mod.runCliChannelOnce(&cfg);
+        }
+        return;
+    } else if (std.mem.eql(u8, cmd, "peripheral")) {
+        try peripherals_mod.listConfiguredPeripherals();
+        return;
+    } else if (std.mem.eql(u8, cmd, "config")) {
+        const sub = if (args.len > cmd_idx + 1) args[cmd_idx + 1] else "";
+        if (std.mem.eql(u8, sub, "set")) {
+            if (args.len < cmd_idx + 4) {
+                try stdout.print("Usage: bareclaw config set <key> <value>\n", .{});
+                try stdout.print("Keys:  default_provider, default_model, memory_backend,\n", .{});
+                try stdout.print("       fallback_providers, api_key, discord_token, telegram_token\n", .{});
+                return;
+            }
+            const key   = args[cmd_idx + 2];
+            const value = args[cmd_idx + 3];
+            if (try cfg.setKey(allocator, key, value)) |err_msg| {
+                defer allocator.free(err_msg);
+                try stdout.print("Error: {s}\n", .{err_msg});
+            } else {
+                try stdout.print("✓ {s} = \"{s}\"\n", .{ key, value });
+                try stdout.print("  Saved to {s}\n", .{cfg.config_path});
+            }
+        } else if (std.mem.eql(u8, sub, "get")) {
+            const key = if (args.len > cmd_idx + 2) args[cmd_idx + 2] else "";
+            if (key.len == 0) {
+                // Print all
+                try stdout.print("default_provider   = \"{s}\"\n", .{cfg.default_provider});
+                try stdout.print("default_model      = \"{s}\"\n", .{cfg.default_model});
+                try stdout.print("memory_backend     = \"{s}\"\n", .{cfg.memory_backend});
+                try stdout.print("fallback_providers = \"{s}\"\n", .{cfg.fallback_providers});
+                try stdout.print("api_key            = \"{s}\"\n", .{if (cfg.api_key.len > 0) "***" else ""});
+                try stdout.print("discord_token      = \"{s}\"\n", .{if (cfg.discord_token.len > 0) "***" else ""});
+                try stdout.print("telegram_token     = \"{s}\"\n", .{if (cfg.telegram_token.len > 0) "***" else ""});
+            } else {
+                try stdout.print("Usage: bareclaw config get  (no key = show all)\n", .{});
+            }
+        } else {
+            try stdout.print("Usage: bareclaw config <set|get> [key] [value]\n", .{});
+            try stdout.print("  bareclaw config set discord_token \"Bot.xxx...\"\n", .{});
+            try stdout.print("  bareclaw config set api_key \"sk-...\"\n", .{});
+            try stdout.print("  bareclaw config get\n", .{});
+        }
+        return;
+    } else if (std.mem.eql(u8, cmd, "migrate")) {
+        try migration_mod.migrateFromOpenClaw("~/.openclaw/workspace");
+        return;
+    } else {
+        try stdout.print("Unknown command: {s}\n", .{cmd});
+        return;
+    }
+}
+
+fn printStatus(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout: anytype) !void {
+    try stdout.print("🐻 BareClaw Status\n\n", .{});
+    try stdout.print("Workspace:  {s}\n", .{cfg.workspace_dir});
+    try stdout.print("Config:     {s}\n", .{cfg.config_path});
+    try stdout.print("Provider:   {s}\n", .{cfg.default_provider});
+    try stdout.print("Model:      {s}\n", .{cfg.default_model});
+    try stdout.print("Memory:     {s}\n", .{cfg.memory_backend});
+
+    // API key configured? Ollama is keyless by design; all other providers need one.
+    const is_keyless = std.mem.eql(u8, cfg.default_provider, "ollama");
+    const has_key = is_keyless or blk: {
+        const k = std.process.getEnvVarOwned(allocator, "BARECLAW_API_KEY") catch
+                  std.process.getEnvVarOwned(allocator, "API_KEY") catch
+                  try allocator.dupe(u8, "");
+        defer allocator.free(k);
+        break :blk k.len > 0 or cfg.api_key.len > 0;
+    };
+    const key_status = if (is_keyless) "local (no key needed)" else if (has_key) "configured ✓" else "NOT SET (echo mode)";
+    try stdout.print("API key:    {s}\n", .{key_status});
+
+    // Count memory files.
+    const mem_dir = try std.fs.path.join(allocator, &.{ cfg.workspace_dir, "memory" });
+    defer allocator.free(mem_dir);
+    var mem_count: usize = 0;
+    if (std.fs.cwd().openDir(mem_dir, .{ .iterate = true })) |d| {
+        var dir = d;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind == .file) mem_count += 1;
+        }
+    } else |_| {}
+    try stdout.print("Memory:     {d} file(s)\n", .{mem_count});
+
+    // Count cron tasks.
+    const cron_tasks = cron_mod.loadTasksPublic(allocator) catch &[_]cron_mod.CronTask{};
+    defer {
+        for (cron_tasks) |*t| @constCast(t).deinit(allocator);
+        allocator.free(cron_tasks);
+    }
+    const enabled_count = blk: {
+        var n: usize = 0;
+        for (cron_tasks) |t| { if (t.enabled) n += 1; }
+        break :blk n;
+    };
+    try stdout.print("Cron tasks: {d} total, {d} enabled\n", .{ cron_tasks.len, enabled_count });
+}
+
+/// Doctor command: check health of key subsystems and report issues.
+fn runDoctor(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout: anytype) !void {
+    try stdout.print("🐻 BareClaw Doctor\n\n", .{});
+
+    var all_ok = true;
+
+    // 1. Workspace directory exists and is writable.
+    {
+        const test_path = try std.fs.path.join(allocator, &.{ cfg.workspace_dir, ".doctor_probe" });
+        defer allocator.free(test_path);
+        std.fs.cwd().makePath(cfg.workspace_dir) catch {};
+        const probe = std.fs.cwd().createFile(test_path, .{ .truncate = true });
+        if (probe) |f| {
+            f.close();
+            std.fs.cwd().deleteFile(test_path) catch {};
+            try stdout.print("  ✓ Workspace writable: {s}\n", .{cfg.workspace_dir});
+        } else |err| {
+            try stdout.print("  ✗ Workspace NOT writable ({s}): {}\n", .{ cfg.workspace_dir, err });
+            all_ok = false;
+        }
+    }
+
+    // 2. Config file present.
+    {
+        const exists = if (std.fs.cwd().openFile(cfg.config_path, .{})) |f| blk: {
+            f.close();
+            break :blk true;
+        } else |_| false;
+        if (exists) {
+            try stdout.print("  ✓ Config file: {s}\n", .{cfg.config_path});
+        } else {
+            try stdout.print("  ⚠ Config file missing (defaults in use): {s}\n", .{cfg.config_path});
+        }
+    }
+
+    // 3. API key.
+    {
+        const k = std.process.getEnvVarOwned(allocator, "BARECLAW_API_KEY") catch
+                  std.process.getEnvVarOwned(allocator, "API_KEY") catch
+                  try allocator.dupe(u8, "");
+        defer allocator.free(k);
+        if (k.len > 0) {
+            try stdout.print("  ✓ API key configured\n", .{});
+        } else {
+            try stdout.print("  ⚠ No API key found – running in echo mode\n", .{});
+        }
+    }
+
+    // 4. Audit log writable.
+    {
+        const log_path = try std.fs.path.join(allocator, &.{ cfg.workspace_dir, "audit.log" });
+        defer allocator.free(log_path);
+        const f = std.fs.cwd().createFile(log_path, .{ .truncate = false, .read = false });
+        if (f) |file| {
+            file.close();
+            try stdout.print("  ✓ Audit log writable\n", .{});
+        } else |err| {
+            try stdout.print("  ✗ Audit log NOT writable: {}\n", .{err});
+            all_ok = false;
+        }
+    }
+
+    // 5. Cron tasks.
+    {
+        const tasks = cron_mod.loadTasksPublic(allocator) catch &[_]cron_mod.CronTask{};
+        defer {
+            for (tasks) |*t| @constCast(t).deinit(allocator);
+            allocator.free(tasks);
+        }
+        try stdout.print("  ✓ Cron: {d} task(s) configured\n", .{tasks.len});
+    }
+
+    try stdout.print("\n", .{});
+    if (all_ok) {
+        try stdout.print("All checks passed.\n", .{});
+    } else {
+        try stdout.print("Some checks FAILED – see above.\n", .{});
+    }
+}
+
