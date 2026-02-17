@@ -1,6 +1,7 @@
 const std = @import("std");
 const security_mod = @import("security.zig");
 const memory_mod = @import("memory.zig");
+const mcp_mod = @import("mcp_client.zig");
 
 pub const ToolResult = struct {
     success: bool,
@@ -8,14 +9,22 @@ pub const ToolResult = struct {
 };
 
 pub const Tool = struct {
-    name: []const u8,
-    executeFn: *const fn (ctx: *ToolContext, args_json: []const u8) anyerror!ToolResult,
+    name:        []const u8,
+    description: []const u8 = "", // human/LLM-readable description; "" = no description
+    executeFn:   *const fn (ctx: *ToolContext, args_json: []const u8) anyerror!ToolResult,
+    /// Optional per-tool metadata (e.g. for MCP proxy tools). Owned by the tool registry.
+    user_data: ?*anyopaque = null,
 };
 
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
+    /// Optional MCP session pool, shared across all MCP proxy tool calls in a session.
+    mcp_pool: ?*mcp_mod.McpSessionPool = null,
+    /// Set by agent.zig dispatch loop to point at the current tool's McpProxyMeta
+    /// before calling toolMcpProxy. Only valid during an MCP proxy tool call.
+    mcp_current_meta: ?*anyopaque = null,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -346,5 +355,144 @@ pub fn buildCoreTools(
 }
 
 pub fn freeTools(allocator: std.mem.Allocator, tools: []Tool) void {
+    allocator.free(tools);
+}
+
+// ── MCP proxy tools ───────────────────────────────────────────────────────────
+//
+// Each MCP server tool is represented as a BareClaw Tool with an McpProxyMeta
+// stored in user_data. The single proxy executeFn reads the metadata to
+// determine which MCP server to call and which tool name to invoke.
+
+/// Per-tool metadata for MCP proxy tools.
+pub const McpProxyMeta = struct {
+    /// The argv used to spawn the MCP server subprocess.
+    server_argv: []const []const u8, // slice of owned strings
+    /// The tool name as published by the MCP server (may differ from Tool.name).
+    mcp_tool_name: []const u8, // owned
+    /// Human-readable description from the MCP server's tools/list response.
+    description: []const u8, // owned
+
+    pub fn deinit(self: *McpProxyMeta, allocator: std.mem.Allocator) void {
+        for (self.server_argv) |arg| allocator.free(arg);
+        allocator.free(self.server_argv);
+        allocator.free(self.mcp_tool_name);
+        allocator.free(self.description);
+        self.* = undefined;
+    }
+};
+
+/// Single executeFn for all MCP proxy tools.
+/// Reads user_data as *McpProxyMeta to know which server and tool to call.
+fn toolMcpProxy(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const pool = ctx.mcp_pool orelse {
+        return ToolResult{ .success = false, .output = "mcp: no session pool in context" };
+    };
+    // user_data is set by buildMcpTools to point at the McpProxyMeta for this tool.
+    // The caller (agent.zig) passes &ctx with the correct tool's user_data already wired in.
+    // However, executeFn doesn't receive the Tool struct — we rely on the per-tool
+    // context passed via a wrapper. Since Zig has no closures, we use a small trampoline:
+    // the tool's name IS the lookup key — but the function doesn't receive its own name.
+    //
+    // Resolution: We MUST have the metadata available. The contract is that callers
+    // wishing to invoke MCP tools must set ctx.mcp_pool AND call via the tool's own
+    // executeFn which has user_data set. We embed a thread-local pointer to current meta.
+    //
+    // Simpler: we accept that ctx needs one more field for MCP tool dispatch.
+    // Add mcp_current_meta to ToolContext temporarily, set by dispatchAllToolCalls.
+    const meta: *McpProxyMeta = @ptrCast(@alignCast(ctx.mcp_current_meta orelse {
+        return ToolResult{ .success = false, .output = "mcp: missing tool metadata in context" };
+    }));
+
+    ctx.policy.auditLog("mcp_tool", meta.mcp_tool_name) catch {};
+
+    const session = pool.getOrStart(meta.server_argv) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: failed to start server: {}", .{err});
+        return ToolResult{ .success = false, .output = msg };
+    };
+
+    const result = session.callTool(meta.mcp_tool_name, args_json) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: call failed: {}", .{err});
+        return ToolResult{ .success = false, .output = msg };
+    };
+
+    return ToolResult{ .success = true, .output = result };
+}
+
+/// Build Tool entries for all tools discovered from a set of MCP servers.
+/// `server_defs` comes from config_mod.parseMcpServers().
+/// The returned tools share a McpSessionPool (also returned via `pool_out`).
+/// Caller is responsible for calling freeMcpTools() and pool.deinit().
+pub fn buildMcpTools(
+    allocator: std.mem.Allocator,
+    server_defs: []const @import("config.zig").McpServerDef,
+    pool_out: *mcp_mod.McpSessionPool,
+) ![]Tool {
+    pool_out.* = mcp_mod.McpSessionPool.init(allocator);
+
+    var list = std.ArrayList(Tool).init(allocator);
+    errdefer list.deinit();
+
+    for (server_defs) |def| {
+        // Start a temporary session to discover the tools list.
+        // We immediately deinit it — the pool will re-spawn on first actual call.
+        var probe = mcp_mod.McpSession.startProbe(allocator, def.argv) catch |err| {
+            std.log.warn("mcp: failed to probe server '{s}': {}", .{ def.name, err });
+            continue;
+        };
+        const discovered = probe.listTools() catch &[_]mcp_mod.McpTool{};
+        probe.deinit();
+
+        for (discovered) |mcp_tool| {
+            defer {} // mcp_tool strings are owned by discovered; we dupe below
+
+            // Build tool name: "servername__toolname" (double underscore).
+            const tool_name = try std.fmt.allocPrint(
+                allocator,
+                "{s}__{s}",
+                .{ def.name, mcp_tool.name },
+            );
+            errdefer allocator.free(tool_name);
+
+            // Build argv copy for the proxy meta.
+            var argv_copy = try allocator.alloc([]const u8, def.argv.len);
+            for (def.argv, 0..) |arg, i| argv_copy[i] = try allocator.dupe(u8, arg);
+
+            const desc_copy = try allocator.dupe(u8, mcp_tool.description);
+            errdefer allocator.free(desc_copy);
+
+            const meta = try allocator.create(McpProxyMeta);
+            meta.* = McpProxyMeta{
+                .server_argv   = argv_copy,
+                .mcp_tool_name = try allocator.dupe(u8, mcp_tool.name),
+                .description   = desc_copy,
+            };
+
+            try list.append(Tool{
+                .name        = tool_name,
+                .description = meta.description, // points into meta — freed via freeMcpTools
+                .executeFn   = toolMcpProxy,
+                .user_data   = @ptrCast(meta),
+            });
+        }
+
+        // Free discovered tools (we've duped what we need).
+        for (@constCast(discovered)) |*t| t.deinit(allocator);
+        allocator.free(discovered);
+    }
+
+    return list.toOwnedSlice();
+}
+
+/// Free MCP tools built by buildMcpTools().
+pub fn freeMcpTools(allocator: std.mem.Allocator, tools: []Tool) void {
+    for (tools) |tool| {
+        if (tool.user_data) |ud| {
+            const meta: *McpProxyMeta = @ptrCast(@alignCast(ud));
+            meta.deinit(allocator);
+            allocator.destroy(meta);
+        }
+        allocator.free(tool.name);
+    }
     allocator.free(tools);
 }

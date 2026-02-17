@@ -17,13 +17,17 @@ Whenever you build a new feature leverage the MCP server to test it. If you need
 
 When building a new feature in BareClaw, the canonical loop is:
 
-1. Understand the current code
+1. Understand the current code — `read_source_file()`, `repo_structure()`
 2. Edit the source code
 3. `build()` — compile and catch errors immediately
-4. `run_tests()` — verify nothing broke
-5. `status()` — confirm runtime config looks right
-6. `run_agent("test prompt")` — end-to-end smoke test
-7. Repeat from step 1
+4. `run_tests()` — Zig unit tests, must be zero failures
+5. `run_smoke_tests()` — binary + status + Ollama + agent round-trip (~15s)
+6. `status()` — confirm runtime config looks right
+7. `run_agent("test prompt")` — quick interactive smoke test
+8. If touching Discord/channels: `run_integration_test_discord()` — full end-to-end (~30s)
+9. Repeat from step 1
+
+**Rule: never finish a session without all applicable test tools passing.**
 
 ## 1) Project Snapshot (Read First)
 
@@ -41,17 +45,19 @@ BareClaw is a **Zig 0.14** autonomous AI agent runtime ptimized for:
 |---|---|
 | `src/provider.zig` | LLM backends — `Provider`, `Router`, `AnyProvider` vtable |
 | `src/channels.zig` | Messaging channels — `AgentStack`, channel run functions |
-| `src/tools.zig` | Agent tools — `Tool` struct, `buildCoreTools()` |
+| `src/tools.zig` | Agent tools — `Tool` struct, `buildCoreTools()`, `buildMcpTools()` |
 | `src/memory.zig` | Memory persistence — `MemoryBackend` |
 | `src/security.zig` | Policy enforcement — `SecurityPolicy`, `allowPath()`, `auditLog()` |
-| `src/config.zig` | Config loading — `Config`, `loadOrInit()`, `quickOnboard()` |
+| `src/config.zig` | Config loading — `Config`, `loadOrInit()`, `parseMcpServers()` |
+| `src/mcp_client.zig` | Generic MCP client — `McpSession`, `McpSessionPool`, JSON-RPC stdio |
 | `src/cron.zig` | Task scheduler — TSV persistence, subcommand dispatch |
 | `src/gateway.zig` | HTTP server — `GET /health`, `POST /webhook` |
 | `src/peripherals.zig` | Hardware peripheral listing (stub, expanding) |
 
 **Current providers:** anthropic, openai, openai-compatible, ollama, openrouter, echo
-**Current tools:** shell, file_read, file_write, memory_store, memory_recall, memory_forget, http_request, git_operations
+**Current tools:** shell, file_read, file_write, memory_store, memory_recall, memory_forget, http_request, git_operations + any tools from configured MCP servers
 **Current channels:** CLI (single-turn + loop), Discord (WebSocket Gateway), Telegram (long-polling)
+**MCP servers:** zero-coupling generic client — any server wired via config at runtime
 
 ---
 
@@ -91,6 +97,10 @@ These are not suggestions — they are compiler-enforced realities that will cau
 
 5. **Zero dependencies is a hard constraint** — do not add Zig packages or C library dependencies. Everything uses `std`. This is what keeps the binary portable to $10 hardware.
 
+6. **MCP client is zero-coupling by design** — `mcp_client.zig` has no knowledge of any specific MCP server. Servers are wired at runtime via `mcp_servers` in config. The `McpProxyMeta` struct in `tools.zig` carries per-tool state (server argv + remote tool name). The `McpSessionPool` in `main.zig` keeps sessions alive across tool calls within one agent run. Channels that don't need MCP pass `null` for `mcp_pool`.
+
+7. **MCP tool naming convention** — discovered MCP tools are named `servername__toolname` (double underscore). This makes them unambiguous to the LLM and parseable at dispatch time. The `tool.user_data` field carries the `*McpProxyMeta` that the proxy executeFn needs.
+
 ---
 
 ## 4) Engineering Principles
@@ -123,7 +133,8 @@ These are not suggestions — they are compiler-enforced realities that will cau
 
 - `zig build` with no flags must produce a working binary on every commit.
 - `zig build test` must pass with zero failures.
-- These are the only two required validation gates.
+- `run_smoke_tests()` must pass before any session ends.
+- `run_integration_test_discord()` must pass after any change to `channels.zig`.
 
 ---
 
@@ -142,6 +153,7 @@ src/
 ├── cron.zig          # TSV task scheduler, subcommand dispatch
 ├── gateway.zig       # Minimal TCP HTTP server
 ├── daemon.zig        # Gateway + cron combined runner
+├── mcp_client.zig    # Generic MCP client — McpSession, McpSessionPool, JSON-RPC stdio
 ├── peripherals.zig   # Hardware peripheral listing stub
 └── migration.zig     # OpenClaw workspace importer
 docs/
@@ -156,9 +168,9 @@ docs/
 
 | Tier | Paths | Required validation |
 |------|-------|---------------------|
-| **Low** | `docs/`, `*.md`, comment-only | No build required |
-| **Medium** | New tools, providers, channels | `zig build` + `zig build test` + smoke test |
-| **High** | `security.zig`, `gateway.zig`, `tools.zig` (shell), `config.zig` schema, path policy | `zig build` + `zig build test` + boundary/failure-mode test |
+| **Low** | `docs/`, `*.md`, comment-only | None |
+| **Medium** | New tools, providers, config fields | `build()` + `run_tests()` + `run_smoke_tests()` |
+| **High** | `channels.zig`, `security.zig`, `gateway.zig`, `tools.zig` (shell), `config.zig` schema | `build()` + `run_tests()` + `run_smoke_tests()` + `run_integration_test_discord()` |
 
 When uncertain, classify higher.
 
@@ -174,18 +186,23 @@ When uncertain, classify higher.
 
 ### Validation (Required)
 
-```bash
-zig build           # zero errors, zero warnings
-zig build test      # all tests pass
-```
+All validation is done through MCP tools — do not run raw shell commands for testing.
 
-For behavioral changes, also run a manual smoke test:
+| Change scope | Required tools |
+|---|---|
+| Any code change | `build()` → `run_tests()` |
+| Behavior/feature change | + `run_smoke_tests()` |
+| `channels.zig` / Discord | + `run_integration_test_discord()` |
+| Config schema change | + `config_get()` to verify round-trip |
+| New MCP tool added | call the new tool to verify it works |
 
-```bash
-./zig-out/bin/bareclaw status
-./zig-out/bin/bareclaw doctor
-./zig-out/bin/bareclaw agent "hello"
-```
+**MCP test tools reference:**
+- `build()` — compile the binary, surface errors immediately
+- `run_tests()` — Zig unit tests (`zig build test`)
+- `run_smoke_tests()` — binary + status + Ollama + agent round-trip (~15s, no Discord)
+- `run_integration_test_discord()` — full Discord bot round-trip via webhook (~30s)
+- `status()` — runtime config sanity check
+- `run_agent("prompt")` — single-turn agent call for interactive verification
 
 ---
 
@@ -214,6 +231,40 @@ Anthropic format note: Anthropic uses `POST /v1/messages`, `x-api-key` header (n
 3. Call `ctx.policy.auditLog("your_tool", detail)` before any action
 4. Call `ctx.policy.allowPath(path)` for any path argument
 5. Define a JSON parameters schema string matching what the LLM will send
+
+### Connecting an MCP Server
+
+BareClaw can use any MCP server as a tool source — no code changes required.
+
+**At the command line:**
+```bash
+bareclaw config set mcp_servers "autotrader=trader mcp serve"
+# Multiple servers: pipe-separated
+bareclaw config set mcp_servers "autotrader=trader mcp serve|mybot=python /path/to/bot.py"
+```
+
+**Via MCP server tools (for agent-driven setup):**
+```
+mcp_add_server(name="autotrader", command="trader mcp serve")
+mcp_list_servers()
+mcp_list_tools(server="autotrader")
+mcp_call_tool(server="autotrader", tool="get_status")
+```
+
+**Format:** `mcp_servers = "name=command arg1 arg2|name2=cmd2 ..."` in `config.toml`
+
+**What happens at agent startup:**
+1. `parseMcpServers()` splits the config string into `McpServerDef` entries
+2. `buildMcpTools()` spawns each server, completes the MCP handshake, calls `tools/list`
+3. Each discovered tool becomes a BareClaw `Tool` named `servername__toolname`
+4. `McpSessionPool` keeps sessions alive across tool calls in one agent run
+
+**Validation:** After adding a server, run:
+```
+mcp_list_tools()      → confirms server connects and exposes tools
+mcp_call_tool(...)    → confirms a round-trip tool call works
+run_smoke_tests()     → full binary health check
+```
 
 ### Security / Gateway Changes
 

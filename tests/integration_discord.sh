@@ -31,9 +31,12 @@ TEST_MESSAGE="<@${BOT_USER_ID}> ${TEST_MARKER}"
 
 CONFIG="$HOME/.bareclaw/config.toml"
 
-# Resolve bot token (for reading messages from channel)
+# Resolve bot token (for reading messages from channel).
+# Priority: DISCORD_BOT_TOKEN → DISCORD_TEST_TOKEN → config.toml discord_token
 if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
     TOKEN="$DISCORD_BOT_TOKEN"
+elif [ -n "${DISCORD_TEST_TOKEN:-}" ]; then
+    TOKEN="$DISCORD_TEST_TOKEN"
 else
     TOKEN=$(grep '^discord_token' "$CONFIG" 2>/dev/null | sed 's/.*= *"\(.*\)"/\1/' || true)
 fi

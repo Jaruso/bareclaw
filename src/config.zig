@@ -21,6 +21,11 @@ pub const Config = struct {
     /// Telegram bot token (optional)
     telegram_token: []const u8,
 
+    /// Pipe-separated list of MCP server definitions.
+    /// Each entry: "name=command arg1 arg2..."
+    /// Example: "autotrader=trader mcp serve|mybot=python bot.py"
+    mcp_servers: []const u8,
+
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.workspace_dir);
         allocator.free(self.config_path);
@@ -32,6 +37,7 @@ pub const Config = struct {
         allocator.free(self.discord_token);
         allocator.free(self.discord_webhook);
         allocator.free(self.telegram_token);
+        allocator.free(self.mcp_servers);
         self.* = undefined;
     }
 
@@ -49,12 +55,16 @@ pub const Config = struct {
             "# Channel tokens\n" ++
             "discord_token   = \"{s}\"\n" ++
             "discord_webhook = \"{s}\"\n" ++
-            "telegram_token  = \"{s}\"\n",
+            "telegram_token  = \"{s}\"\n" ++
+            "\n" ++
+            "# MCP servers (pipe-separated: name=command arg1 arg2...)\n" ++
+            "mcp_servers = \"{s}\"\n",
             .{
                 self.default_provider, self.default_model,
                 self.memory_backend,   self.fallback_providers,
                 self.api_key,
                 self.discord_token,    self.discord_webhook,  self.telegram_token,
+                self.mcp_servers,
             },
         );
     }
@@ -65,6 +75,7 @@ pub const Config = struct {
         const known_keys = [_][]const u8{
             "default_provider", "default_model", "memory_backend",
             "fallback_providers", "api_key", "discord_token", "discord_webhook", "telegram_token",
+            "mcp_servers",
         };
         var found = false;
         for (known_keys) |k| {
@@ -73,7 +84,7 @@ pub const Config = struct {
         if (!found) {
             return try std.fmt.allocPrint(
                 allocator,
-                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, telegram_token",
+                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, telegram_token, mcp_servers",
                 .{key},
             );
         }
@@ -104,6 +115,9 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, key, "telegram_token")) {
             allocator.free(self.telegram_token);
             self.telegram_token = duped;
+        } else if (std.mem.eql(u8, key, "mcp_servers")) {
+            allocator.free(self.mcp_servers);
+            self.mcp_servers = duped;
         } else {
             allocator.free(duped);
         }
@@ -140,6 +154,7 @@ pub fn loadOrInit(allocator: std.mem.Allocator) !Config {
         .discord_token      = try allocator.dupe(u8, ""),
         .discord_webhook    = try allocator.dupe(u8, ""),
         .telegram_token     = try allocator.dupe(u8, ""),
+        .mcp_servers        = try allocator.dupe(u8, ""),
     };
 
     // Best-effort: parse existing config.toml for a few keys.
@@ -202,6 +217,11 @@ fn parseSimpleToml(cfg: *Config, contents: []u8, allocator: std.mem.Allocator) !
                 allocator.free(cfg.telegram_token);
                 cfg.telegram_token = try allocator.dupe(u8, val);
             }
+        } else if (std.mem.startsWith(u8, line, "mcp_servers")) {
+            if (parseValue(line)) |val| {
+                allocator.free(cfg.mcp_servers);
+                cfg.mcp_servers = try allocator.dupe(u8, val);
+            }
         }
     }
 }
@@ -222,5 +242,67 @@ pub fn quickOnboard(cfg: *Config, allocator: std.mem.Allocator, writer: anytype)
     try writer.print("Default provider: {s}\n", .{cfg.default_provider});
     try writer.print("Default model:    {s}\n", .{cfg.default_model});
     try writer.print("Memory backend:   {s}\n", .{cfg.memory_backend});
+}
+
+/// A parsed MCP server definition.
+pub const McpServerDef = struct {
+    name: []const u8,   // owned
+    argv: [][]const u8, // owned slice of owned strings
+
+    pub fn deinit(self: *McpServerDef, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+        self.* = undefined;
+    }
+};
+
+/// Parse cfg.mcp_servers into a slice of McpServerDef.
+/// Format: "name=command arg1 arg2|name2=cmd2 ..."
+/// Caller owns the returned slice and each McpServerDef.
+pub fn parseMcpServers(cfg: *const Config, allocator: std.mem.Allocator) ![]McpServerDef {
+    if (cfg.mcp_servers.len == 0) return &[_]McpServerDef{};
+
+    var list = std.ArrayList(McpServerDef).init(allocator);
+    errdefer {
+        for (list.items) |*s| s.deinit(allocator);
+        list.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, cfg.mcp_servers, '|');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t");
+        if (trimmed.len == 0) continue;
+
+        // Split on first '=' to get name and command string.
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const name    = std.mem.trim(u8, trimmed[0..eq],      " \t");
+        const cmd_str = std.mem.trim(u8, trimmed[eq + 1 ..],  " \t");
+        if (name.len == 0 or cmd_str.len == 0) continue;
+
+        // Split command string on spaces to build argv.
+        var args_list = std.ArrayList([]const u8).init(allocator);
+        errdefer {
+            for (args_list.items) |a| allocator.free(a);
+            args_list.deinit();
+        }
+        var word_it = std.mem.splitScalar(u8, cmd_str, ' ');
+        while (word_it.next()) |word| {
+            const w = std.mem.trim(u8, word, " \t");
+            if (w.len > 0) try args_list.append(try allocator.dupe(u8, w));
+        }
+        if (args_list.items.len == 0) {
+            for (args_list.items) |a| allocator.free(a);
+            args_list.deinit();
+            continue;
+        }
+
+        try list.append(McpServerDef{
+            .name = try allocator.dupe(u8, name),
+            .argv = try args_list.toOwnedSlice(),
+        });
+    }
+
+    return list.toOwnedSlice();
 }
 

@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 BINARY = REPO_ROOT / "zig-out" / "bin" / "bareclaw"
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> dict:
+def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60, env: dict | None = None) -> dict:
     """Run a subprocess and return stdout, stderr, and return code."""
     try:
         result = subprocess.run(
@@ -39,6 +39,7 @@ def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return {
             "stdout": result.stdout.strip(),
@@ -231,31 +232,52 @@ def read_config() -> str:
 
 @mcp.tool()
 def run_smoke_tests() -> str:
-    """Run the BareClaw smoke test suite (no Discord needed).
+    """Run the BareClaw smoke test suite. No Discord required.
 
+    USE THIS after every non-trivial code change to verify nothing broke.
     Checks: binary exists, status works, zig unit tests pass,
     Ollama is reachable, agent round-trip responds.
+    Fast (~15s). Always run before run_integration_test_discord.
     """
     script = REPO_ROOT / "tests" / "smoke.sh"
-    result = _run(["bash", str(script)], timeout=60)
+    result = _run(["bash", str(script)], timeout=90)
     return _format(result)
 
 
 @mcp.tool()
-def run_integration_test_discord(channel_id: str = "1473381266047893596") -> str:
-    """Run the full Discord integration test.
+def run_integration_test_discord() -> str:
+    """Run the full Discord end-to-end integration test.
 
-    Starts the bot, sends a real message via Discord REST API,
-    waits for the bot to reply, verifies the reply arrived.
+    USE THIS to validate the Discord channel feature end-to-end.
+    Starts the bot, sends a real @mention via webhook to #testing,
+    waits for the bot to reply via Ollama, verifies the reply arrived.
+    Requires: Ollama running, discord_token + discord_webhook in config.
+    Slower (~30s). Run after smoke tests pass.
 
-    Args:
-        channel_id: Discord channel ID to use for the test.
+    Bot token resolution order:
+      1. DISCORD_TEST_TOKEN in .env (integration test token, preferred)
+      2. DISCORD_BOT_TOKEN in environment
+      3. discord_token in ~/.bareclaw/config.toml
     """
     script = REPO_ROOT / "tests" / "integration_discord.sh"
-    import os
     env = os.environ.copy()
-    env["CHANNEL_ID"] = channel_id
-    result = _run(["bash", str(script)], timeout=120)
+    env["BINARY"] = str(BINARY)
+
+    # Load .env from the repo root and inject DISCORD_TEST_TOKEN so the
+    # integration test uses the dev bot token regardless of what personal
+    # token is set in config.toml.
+    dot_env = REPO_ROOT / ".env"
+    if dot_env.exists():
+        for line in dot_env.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            env.setdefault(key, val)  # don't override vars already in env
+
+    result = _run(["bash", str(script)], timeout=120, env=env)
     return _format(result)
 
 
@@ -292,6 +314,117 @@ def workspace_contents() -> str:
         if item.is_file():
             lines.append(str(rel))
     return "\n".join(lines) if lines else "Workspace exists but is empty."
+
+
+# ---------------------------------------------------------------------------
+# MCP server management tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def mcp_list_servers() -> str:
+    """List all configured MCP servers that BareClaw knows about.
+
+    MCP servers extend BareClaw with external tools (e.g. AutoTrader, custom bots).
+    """
+    result = _run([str(BINARY), "mcp", "list-servers"])
+    return _format(result)
+
+
+@mcp.tool()
+def mcp_list_tools(server: str = "") -> str:
+    """List all tools available from configured MCP servers.
+
+    Connects to each server, runs tools/list, and displays the results.
+
+    Args:
+        server: Filter to a specific server by name. If empty, lists all servers.
+    """
+    cmd = [str(BINARY), "mcp", "list-tools"]
+    if server:
+        cmd.append(server)
+    result = _run(cmd, timeout=30)
+    return _format(result)
+
+
+@mcp.tool()
+def mcp_call_tool(server: str, tool: str, args_json: str = "{}") -> str:
+    """Call a specific tool on a configured MCP server.
+
+    Useful for testing MCP server connectivity and tool responses.
+
+    Args:
+        server: The server name as configured (e.g. "autotrader").
+        tool: The tool name to call (e.g. "get_balance").
+        args_json: JSON object of arguments, e.g. '{"symbol": "AAPL"}'.
+    """
+    result = _run([str(BINARY), "mcp", "call", server, tool, args_json], timeout=30)
+    return _format(result)
+
+
+@mcp.tool()
+def mcp_add_server(name: str, command: str) -> str:
+    """Add or update an MCP server in BareClaw's config.
+
+    Appends the server to the mcp_servers config key. If a server with the
+    same name exists, it is replaced.
+
+    Args:
+        name: Short identifier for this server (e.g. "autotrader").
+        command: Full command to launch the server (e.g. "trader mcp serve").
+    """
+    config_path = Path.home() / ".bareclaw" / "config.toml"
+    if not config_path.exists():
+        return "Config file not found. Run bareclaw status first."
+
+    content = config_path.read_text()
+
+    # Parse existing mcp_servers value.
+    import re
+    match = re.search(r'^mcp_servers\s*=\s*"(.*?)"', content, re.MULTILINE)
+    if match:
+        existing = match.group(1)
+        # Remove any existing entry with the same name.
+        entries = [e for e in existing.split("|") if e and not e.startswith(f"{name}=")]
+        entries.append(f"{name}={command}")
+        new_val = "|".join(entries)
+        new_content = content[:match.start()] + f'mcp_servers = "{new_val}"' + content[match.end():]
+    else:
+        # No mcp_servers line yet — append it.
+        new_content = content.rstrip() + f'\nmcp_servers = "{name}={command}"\n'
+
+    config_path.write_text(new_content)
+    return f"✓ Added MCP server '{name}' → {command}\n  Saved to {config_path}"
+
+
+@mcp.tool()
+def mcp_remove_server(name: str) -> str:
+    """Remove an MCP server from BareClaw's config by name.
+
+    Args:
+        name: The server name to remove (e.g. "autotrader").
+    """
+    config_path = Path.home() / ".bareclaw" / "config.toml"
+    if not config_path.exists():
+        return "Config file not found."
+
+    content = config_path.read_text()
+
+    import re
+    match = re.search(r'^mcp_servers\s*=\s*"(.*?)"', content, re.MULTILINE)
+    if not match:
+        return f"No mcp_servers configured. Nothing to remove."
+
+    existing = match.group(1)
+    entries = [e for e in existing.split("|") if e and not e.startswith(f"{name}=")]
+    removed = len(existing.split("|")) - len(entries)
+    if removed == 0:
+        return f"Server '{name}' not found in mcp_servers."
+
+    new_val = "|".join(entries)
+    new_content = content[:match.start()] + f'mcp_servers = "{new_val}"' + content[match.end():]
+    config_path.write_text(new_content)
+    return f"✓ Removed MCP server '{name}'. Remaining: {new_val or '(none)'}"
 
 
 def main():

@@ -12,6 +12,7 @@ const cron_mod = @import("cron.zig");
 const channels_mod = @import("channels.zig");
 const peripherals_mod = @import("peripherals.zig");
 const migration_mod = @import("migration.zig");
+const mcp_mod = @import("mcp_client.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -26,20 +27,24 @@ pub fn main() !void {
     if (args.len <= 1) {
         try stdout.print("BareClaw – zero-compromise AI claws, bear edition.\n", .{});
         try stdout.print("Usage: {s} [--api-key <key>] <command> [options]\n", .{args[0]});
-        try stdout.print("Commands: onboard | agent | status | doctor | config | gateway | daemon | cron | channel | peripheral | migrate\n", .{});
+        try stdout.print("Commands: onboard | agent | status | doctor | config | mcp | gateway | daemon | cron | channel | peripheral | migrate\n", .{});
         return;
     }
 
     var cfg = try config_mod.loadOrInit(allocator);
     defer cfg.deinit(allocator);
 
-    // Parse --api-key <value> anywhere before the command, override cfg.api_key.
+    // Parse global flags before the command: --api-key, --debug
     var cmd_idx: usize = 1;
+    var debug_mode = false;
     while (cmd_idx < args.len) {
         if (std.mem.eql(u8, args[cmd_idx], "--api-key") and cmd_idx + 1 < args.len) {
             allocator.free(cfg.api_key);
             cfg.api_key = try allocator.dupe(u8, args[cmd_idx + 1]);
             cmd_idx += 2;
+        } else if (std.mem.eql(u8, args[cmd_idx], "--debug")) {
+            debug_mode = true;
+            cmd_idx += 1;
         } else {
             break;
         }
@@ -94,11 +99,37 @@ pub fn main() !void {
         var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
         defer policy.deinit(allocator);
 
-        const tool_registry = try tools_mod.buildCoreTools(allocator, &policy, &mem_backend);
-        defer tools_mod.freeTools(allocator, tool_registry);
+        // Build core tools.
+        var all_tools = std.ArrayList(tools_mod.Tool).init(allocator);
+        defer all_tools.deinit();
 
-        const input = if (args.len > 2)
-            args[2]
+        const core_tools = try tools_mod.buildCoreTools(allocator, &policy, &mem_backend);
+        defer tools_mod.freeTools(allocator, core_tools);
+        try all_tools.appendSlice(core_tools);
+
+        // Build MCP tools (if any servers are configured).
+        var mcp_pool: mcp_mod.McpSessionPool = undefined;
+        var mcp_tools: []tools_mod.Tool = &[_]tools_mod.Tool{};
+        var has_mcp = false;
+
+        const server_defs = try config_mod.parseMcpServers(&cfg, allocator);
+        defer {
+            for (@constCast(server_defs)) |*s| s.deinit(allocator);
+            allocator.free(server_defs);
+        }
+
+        if (server_defs.len > 0) {
+            mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+            has_mcp = true;
+            try all_tools.appendSlice(mcp_tools);
+        }
+        defer if (has_mcp) {
+            tools_mod.freeMcpTools(allocator, mcp_tools);
+            mcp_pool.deinit();
+        };
+
+        const input = if (args.len > cmd_idx + 1)
+            args[cmd_idx + 1]
         else
             "Hello from BareClaw. How can you help me today?";
 
@@ -107,8 +138,9 @@ pub fn main() !void {
             &cfg,
             any_provider,
             &mem_backend,
-            tool_registry,
+            all_tools.items,
             &policy,
+            if (has_mcp) &mcp_pool else null,
             input,
         );
         return;
@@ -127,9 +159,9 @@ pub fn main() !void {
         return;
     } else if (std.mem.eql(u8, cmd, "channel")) {
         // Subcommands: cli (default), discord, telegram, loop
-        const sub = if (args.len > 2) args[2] else "cli";
+        const sub = if (args.len > cmd_idx + 1) args[cmd_idx + 1] else "cli";
         if (std.mem.eql(u8, sub, "discord")) {
-            try channels_mod.runDiscordChannel(&cfg);
+            try channels_mod.runDiscordChannel(&cfg, debug_mode);
         } else if (std.mem.eql(u8, sub, "telegram")) {
             try channels_mod.runTelegramChannel(&cfg);
         } else if (std.mem.eql(u8, sub, "loop")) {
@@ -178,6 +210,97 @@ pub fn main() !void {
             try stdout.print("  bareclaw config set discord_token \"Bot.xxx...\"\n", .{});
             try stdout.print("  bareclaw config set api_key \"sk-...\"\n", .{});
             try stdout.print("  bareclaw config get\n", .{});
+        }
+        return;
+    } else if (std.mem.eql(u8, cmd, "mcp")) {
+        // Subcommands: list-servers, list-tools [server], call <server> <tool> [args_json]
+        const sub = if (args.len > cmd_idx + 1) args[cmd_idx + 1] else "list-servers";
+
+        if (std.mem.eql(u8, sub, "list-servers")) {
+            const server_defs = try config_mod.parseMcpServers(&cfg, allocator);
+            defer {
+                for (@constCast(server_defs)) |*s| s.deinit(allocator);
+                allocator.free(server_defs);
+            }
+            if (server_defs.len == 0) {
+                try stdout.print("No MCP servers configured.\n", .{});
+                try stdout.print("Add one with: bareclaw config set mcp_servers \"name=command args\"\n", .{});
+            } else {
+                try stdout.print("{d} MCP server(s):\n", .{server_defs.len});
+                for (server_defs) |def| {
+                    const cmd_str = try std.mem.join(allocator, " ", def.argv);
+                    defer allocator.free(cmd_str);
+                    try stdout.print("  {s} → {s}\n", .{ def.name, cmd_str });
+                }
+            }
+        } else if (std.mem.eql(u8, sub, "list-tools")) {
+            // Filter by server name if provided.
+            const filter = if (args.len > cmd_idx + 2) args[cmd_idx + 2] else "";
+            const server_defs = try config_mod.parseMcpServers(&cfg, allocator);
+            defer {
+                for (@constCast(server_defs)) |*s| s.deinit(allocator);
+                allocator.free(server_defs);
+            }
+            if (server_defs.len == 0) {
+                try stdout.print("No MCP servers configured.\n", .{});
+            }
+            for (server_defs) |def| {
+                if (filter.len > 0 and !std.mem.eql(u8, filter, def.name)) continue;
+                try stdout.print("Server: {s}\n", .{def.name});
+                var session = mcp_mod.McpSession.start(allocator, def.argv) catch |err| {
+                    try stdout.print("  (error starting server: {})\n", .{err});
+                    continue;
+                };
+                const discovered = session.listTools() catch &[_]mcp_mod.McpTool{};
+                session.deinit();
+                if (discovered.len == 0) {
+                    try stdout.print("  (no tools found)\n", .{});
+                }
+                for (discovered) |t| {
+                    try stdout.print("  {s}__{s}\n    {s}\n", .{ def.name, t.name, t.description });
+                }
+                for (@constCast(discovered)) |*t| t.deinit(allocator);
+                allocator.free(discovered);
+            }
+        } else if (std.mem.eql(u8, sub, "call")) {
+            // Usage: bareclaw mcp call <server> <tool> [args_json]
+            if (args.len < cmd_idx + 4) {
+                try stdout.print("Usage: bareclaw mcp call <server> <tool> [args_json]\n", .{});
+                return;
+            }
+            const server_name = args[cmd_idx + 2];
+            const tool_name   = args[cmd_idx + 3];
+            const call_args   = if (args.len > cmd_idx + 4) args[cmd_idx + 4] else "{}";
+
+            const server_defs = try config_mod.parseMcpServers(&cfg, allocator);
+            defer {
+                for (@constCast(server_defs)) |*s| s.deinit(allocator);
+                allocator.free(server_defs);
+            }
+
+            var found_def: ?config_mod.McpServerDef = null;
+            for (server_defs) |def| {
+                if (std.mem.eql(u8, def.name, server_name)) {
+                    found_def = def;
+                    break;
+                }
+            }
+            if (found_def == null) {
+                try stdout.print("Server '{s}' not found. Run: bareclaw mcp list-servers\n", .{server_name});
+                return;
+            }
+
+            var session = try mcp_mod.McpSession.start(allocator, found_def.?.argv);
+            defer session.deinit();
+
+            const result = try session.callTool(tool_name, call_args);
+            defer allocator.free(result);
+            try stdout.print("{s}\n", .{result});
+        } else {
+            try stdout.print("Usage: bareclaw mcp <list-servers|list-tools|call>\n", .{});
+            try stdout.print("  bareclaw mcp list-servers\n", .{});
+            try stdout.print("  bareclaw mcp list-tools [server]\n", .{});
+            try stdout.print("  bareclaw mcp call <server> <tool> [args_json]\n", .{});
         }
         return;
     } else if (std.mem.eql(u8, cmd, "migrate")) {

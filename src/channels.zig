@@ -13,6 +13,7 @@ const agent_mod    = @import("agent.zig");
 const config_mod   = @import("config.zig");
 const provider_mod = @import("provider.zig");
 const memory_mod   = @import("memory.zig");
+const mcp_mod      = @import("mcp_client.zig");
 const tools_mod    = @import("tools.zig");
 const security_mod = @import("security.zig");
 
@@ -71,7 +72,7 @@ pub fn runCliChannelOnce(cfg: *const config_mod.Config) !void {
 
     try agent_mod.runAgentOnce(
         allocator, cfg, any_provider,
-        &stack.mem_backend, stack.tool_registry, &stack.policy, line,
+        &stack.mem_backend, stack.tool_registry, &stack.policy, null, line,
     );
 }
 
@@ -88,6 +89,32 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     defer stack.deinit(allocator);
     const any_provider = provider_mod.AnyProvider.fromProvider(&stack.provider);
 
+    // Build MCP tools once, reuse the session pool across all messages.
+    var mcp_pool: mcp_mod.McpSessionPool = undefined;
+    var mcp_tools: []tools_mod.Tool = &[_]tools_mod.Tool{};
+    var has_mcp = false;
+
+    const server_defs = try config_mod.parseMcpServers(cfg, allocator);
+    defer {
+        for (@constCast(server_defs)) |*s| s.deinit(allocator);
+        allocator.free(server_defs);
+    }
+
+    if (server_defs.len > 0) {
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        has_mcp = true;
+    }
+    defer if (has_mcp) {
+        tools_mod.freeMcpTools(allocator, mcp_tools);
+        mcp_pool.deinit();
+    };
+
+    // Combine core tools + MCP tools into one registry.
+    var all_tools = std.ArrayList(tools_mod.Tool).init(allocator);
+    defer all_tools.deinit();
+    try all_tools.appendSlice(stack.tool_registry);
+    try all_tools.appendSlice(mcp_tools);
+
     try stdout.print("BareClaw interactive CLI – type 'exit' to quit.\n", .{});
 
     var buf: [4096]u8 = undefined;
@@ -101,7 +128,9 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
 
         agent_mod.runAgentOnce(
             allocator, cfg, any_provider,
-            &stack.mem_backend, stack.tool_registry, &stack.policy, trimmed,
+            &stack.mem_backend, all_tools.items, &stack.policy,
+            if (has_mcp) &mcp_pool else null,
+            trimmed,
         ) catch |err| {
             try stdout.print("agent error: {}\n", .{err});
         };
@@ -133,7 +162,8 @@ const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
 
 /// Run the Discord channel — connects to Gateway and processes MESSAGE_CREATE
 /// events until the process is killed.
-pub fn runDiscordChannel(cfg: *const config_mod.Config) !void {
+/// Pass debug=true (via `bareclaw --debug channel discord`) for verbose logging.
+pub fn runDiscordChannel(cfg: *const config_mod.Config, debug: bool) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -154,11 +184,53 @@ pub fn runDiscordChannel(cfg: *const config_mod.Config) !void {
     defer stack.deinit(allocator);
     const any_provider = provider_mod.AnyProvider.fromProvider(&stack.provider);
 
+    // Build MCP tools once at startup — reused across all messages.
+    var mcp_pool: mcp_mod.McpSessionPool = undefined;
+    var mcp_tools: []tools_mod.Tool = &[_]tools_mod.Tool{};
+    var has_mcp = false;
+
+    const server_defs = try config_mod.parseMcpServers(cfg, allocator);
+    defer {
+        for (@constCast(server_defs)) |*s| s.deinit(allocator);
+        allocator.free(server_defs);
+    }
+
+    if (server_defs.len > 0) {
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        has_mcp = true;
+        try stdout.print("Discord: loaded {d} MCP tool(s)\n", .{mcp_tools.len});
+    }
+    defer if (has_mcp) {
+        tools_mod.freeMcpTools(allocator, mcp_tools);
+        mcp_pool.deinit();
+    };
+
+    // Combine core tools + MCP tools into one registry.
+    var all_tools = std.ArrayList(tools_mod.Tool).init(allocator);
+    defer all_tools.deinit();
+    try all_tools.appendSlice(stack.tool_registry);
+    try all_tools.appendSlice(mcp_tools);
+
     try stdout.print("Discord channel: connecting to Gateway...\n", .{});
 
-    discordGatewayLoop(allocator, cfg, token, any_provider, stdout) catch |err| {
-        try stdout.print("Discord gateway error: {}\n", .{err});
-    };
+    // Reconnect loop: Discord closes connections periodically (opcode 8, network
+    // hiccups, session invalidation). Back off and reconnect instead of exiting.
+    var attempt: u32 = 0;
+    while (true) {
+        discordGatewayLoop(
+            allocator, cfg, token, any_provider,
+            &stack.mem_backend, &stack.policy,
+            all_tools.items, if (has_mcp) &mcp_pool else null,
+            stdout, debug,
+        ) catch |err| {
+            const delay_s: u64 = @min(30, @as(u64, attempt) * 5 + 5);
+            try stdout.print("Discord gateway error: {} — reconnecting in {d}s...\n",
+                .{ err, delay_s });
+            std.time.sleep(delay_s * std.time.ns_per_s);
+        };
+        attempt += 1;
+        try stdout.print("Discord: reconnect attempt {d}...\n", .{attempt});
+    }
 }
 
 /// Minimal Discord Gateway loop.
@@ -172,29 +244,40 @@ fn discordGatewayLoop(
     cfg: *const config_mod.Config,
     token: []const u8,
     any_provider: provider_mod.AnyProvider,
+    memory: *memory_mod.MemoryBackend,
+    policy: *security_mod.SecurityPolicy,
+    tools: []const tools_mod.Tool,
+    mcp_pool: ?*mcp_mod.McpSessionPool,
     stdout: anytype,
+    debug: bool,
 ) !void {
     // ── 1. TCP + TLS connection ──────────────────────────────────────────────
     const host = "gateway.discord.gg";
     const port: u16 = 443;
 
+    if (debug) try stdout.print("[DEBUG] Resolving DNS for {s}:{d}...\n", .{ host, port });
     const addr_list = try std.net.getAddressList(allocator, host, port);
     defer addr_list.deinit();
     if (addr_list.addrs.len == 0) return error.DnsResolutionFailed;
+    if (debug) try stdout.print("[DEBUG] DNS resolved, {d} address(es). Connecting TCP...\n", .{addr_list.addrs.len});
 
     var tcp = try std.net.tcpConnectToAddress(addr_list.addrs[0]);
     defer tcp.close();
+    if (debug) try stdout.print("[DEBUG] TCP connected.\n", .{});
 
     // In Zig 0.14 tls.Client, every read/write takes the underlying stream.
+    if (debug) try stdout.print("[DEBUG] Loading TLS certificates...\n", .{});
     var bundle = std.crypto.Certificate.Bundle{};
     try bundle.rescan(allocator);
     defer bundle.deinit(allocator);
 
+    if (debug) try stdout.print("[DEBUG] Initiating TLS handshake...\n", .{});
     var tls = try std.crypto.tls.Client.init(tcp, .{
         .host = .{ .explicit = host },
         .ca = .{ .bundle = bundle },
     });
     // tls.deinit() is called automatically on the stack frame exit.
+    if (debug) try stdout.print("[DEBUG] TLS handshake complete.\n", .{});
 
     // ── 2. WebSocket upgrade handshake ───────────────────────────────────────
     var key_bytes: [16]u8 = undefined;
@@ -213,9 +296,11 @@ fn discordGatewayLoop(
         .{ host, key_b64 },
     );
     defer allocator.free(upgrade_req);
+    if (debug) try stdout.print("[DEBUG] Sending WebSocket upgrade request...\n", .{});
     try tls.writeAll(tcp, upgrade_req);
 
     // Read HTTP response headers.
+    if (debug) try stdout.print("[DEBUG] Reading WebSocket upgrade response...\n", .{});
     var hdr_buf: [2048]u8 = undefined;
     var hdr_len: usize = 0;
     while (hdr_len < hdr_buf.len) {
@@ -225,10 +310,26 @@ fn discordGatewayLoop(
         if (std.mem.indexOf(u8, hdr_buf[0..hdr_len], "\r\n\r\n") != null) break;
     }
     if (std.mem.indexOf(u8, hdr_buf[0..hdr_len], "101") == null) {
+        if (debug) try stdout.print("[DEBUG] Upgrade response: {s}\n", .{hdr_buf[0..hdr_len]});
         return error.WebSocketUpgradeFailed;
     }
 
     try stdout.print("Discord: WebSocket connected\n", .{});
+
+    // Set a read timeout on the socket so the event loop can fire heartbeats
+    // even when Discord sends no messages. Without this, tls.readAtLeast()
+    // blocks forever and the heartbeat check at the top of the loop never runs,
+    // causing Discord to close the connection due to missed heartbeats.
+    // 5-second timeout: short enough to keep heartbeats on time (interval ~41s).
+    if (debug) try stdout.print("[DEBUG] Setting SO_RCVTIMEO = 5s on socket fd={d}...\n", .{tcp.handle});
+    const timeout_tv = std.posix.timeval{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(
+        tcp.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout_tv),
+    );
+    if (debug) try stdout.print("[DEBUG] SO_RCVTIMEO set. Entering event loop.\n", .{});
 
     // ── 3. Send Identify payload ─────────────────────────────────────────────
     // Intents:
@@ -260,24 +361,39 @@ fn discordGatewayLoop(
     while (true) {
         const now = std.time.milliTimestamp();
         if (now - last_heartbeat >= @as(i64, @intCast(heartbeat_interval_ms))) {
+            if (debug) try stdout.print("[DEBUG] Sending heartbeat (seq={d}, interval={d}ms)...\n",
+                .{ sequence, heartbeat_interval_ms });
             const hb = try std.fmt.allocPrint(allocator, "{{\"op\":1,\"d\":{d}}}", .{sequence});
             defer allocator.free(hb);
             try tlsWsSendText(&tls, tcp, allocator, hb);
             last_heartbeat = now;
+            if (debug) try stdout.print("[DEBUG] Heartbeat sent.\n", .{});
         }
 
         const payload = tlsWsReadFrame(allocator, &tls, tcp, &frame_buf) catch |err| switch (err) {
-            error.WouldBlock => continue,
+            // Timeout fired (SO_RCVTIMEO) — no data yet, loop back to check heartbeat.
+            error.WouldBlock, error.ConnectionTimedOut => {
+                if (debug) try stdout.print("[DEBUG] Read timeout (no data), looping for heartbeat check.\n", .{});
+                continue;
+            },
             else => return err,
         };
         if (payload.len == 0) continue;
         defer allocator.free(payload);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
+        if (debug) try stdout.print("[DEBUG] Frame received ({d} bytes): {s}\n",
+            .{ payload.len, if (payload.len > 200) payload[0..200] else payload });
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
+            if (debug) try stdout.print("[DEBUG] Failed to parse frame as JSON, skipping.\n", .{});
+            continue;
+        };
         defer parsed.deinit();
 
         const op_val = parsed.value.object.get("op") orelse continue;
         const op: i64 = switch (op_val) { .integer => |i| i, else => continue };
+
+        if (debug) try stdout.print("[DEBUG] Gateway op={d}\n", .{op});
 
         if (parsed.value.object.get("s")) |sv| {
             if (sv == .integer) sequence = sv.integer;
@@ -289,10 +405,13 @@ fn discordGatewayLoop(
                 if (d.object.get("heartbeat_interval")) |hbi| {
                     if (hbi == .integer) heartbeat_interval_ms = @intCast(hbi.integer);
                 }
+                if (debug) try stdout.print("[DEBUG] Hello received, heartbeat_interval={d}ms\n",
+                    .{heartbeat_interval_ms});
             },
             0 => {
                 const t_val = parsed.value.object.get("t") orelse continue;
                 const event_type = switch (t_val) { .string => |s| s, else => continue };
+                if (debug) try stdout.print("[DEBUG] Dispatch event: {s}\n", .{event_type});
 
                 if (std.mem.eql(u8, event_type, "READY")) {
                     // READY payload contains the bot's own user object.
@@ -335,27 +454,89 @@ fn discordGatewayLoop(
                     const channel_id = switch (channel_id_val) { .string => |s| s, else => continue };
                     if (content_raw.len == 0) continue;
 
-                    // Only respond when the bot is @mentioned.
-                    // Build the mention string: <@BOT_ID>
-                    const mention = try std.fmt.allocPrint(allocator, "<@{s}>", .{bot_id});
+                    if (debug) try stdout.print("[DEBUG] MESSAGE_CREATE ch={s} content=\"{s}\"\n",
+                        .{ channel_id, if (content_raw.len > 100) content_raw[0..100] else content_raw });
+
+                    // Determine whether the bot was mentioned. Discord sends
+                    // three kinds of mentions we want to catch:
+                    //   <@BOT_ID>   — direct user mention
+                    //   <@!BOT_ID>  — nickname-based user mention (older clients)
+                    //   <@&ROLE_ID> — role mention (bot has that role)
+                    //
+                    // Strategy (most reliable to least):
+                    //   1. d.mentions[] array: Discord populates this with user
+                    //      objects for every direct user mention. Check if bot_id
+                    //      appears here.
+                    //   2. d.mention_roles[]: if non-empty, a role was @mentioned.
+                    //      Since the bot presumably has that role, respond.
+                    //   3. Content string fallback: search for <@BOT_ID> or
+                    //      <@!BOT_ID> in case the arrays are missing.
+                    const mention        = try std.fmt.allocPrint(allocator, "<@{s}>",  .{bot_id});
                     defer allocator.free(mention);
-                    const is_mentioned = bot_id.len > 0 and
-                        std.mem.indexOf(u8, content_raw, mention) != null;
+                    const mention_nick   = try std.fmt.allocPrint(allocator, "<@!{s}>", .{bot_id});
+                    defer allocator.free(mention_nick);
+
+                    const is_mentioned = detect: {
+                        if (bot_id.len == 0) break :detect true; // READY not yet received
+
+                        // 1. Check d.mentions[] for the bot's user ID.
+                        if (d.object.get("mentions")) |mentions_val| {
+                            if (mentions_val == .array) {
+                                for (mentions_val.array.items) |m| {
+                                    if (m != .object) continue;
+                                    if (m.object.get("id")) |id_val| {
+                                        if (id_val == .string and
+                                            std.mem.eql(u8, id_val.string, bot_id))
+                                        {
+                                            break :detect true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. Check d.mention_roles[]: any role mention → respond.
+                        if (d.object.get("mention_roles")) |roles_val| {
+                            if (roles_val == .array and roles_val.array.items.len > 0) {
+                                break :detect true;
+                            }
+                        }
+
+                        // 3. Content string fallback (<@BOT_ID> or <@!BOT_ID>).
+                        if (std.mem.indexOf(u8, content_raw, mention)      != null) break :detect true;
+                        if (std.mem.indexOf(u8, content_raw, mention_nick) != null) break :detect true;
+
+                        break :detect false;
+                    };
+
+                    if (debug) try stdout.print(
+                        "[DEBUG] bot_id=\"{s}\" is_mentioned={}\n",
+                        .{ bot_id, is_mentioned },
+                    );
 
                     // If we have a bot_id and are not mentioned, skip.
                     // If bot_id is empty (READY not yet received), respond to everything.
-                    if (bot_id.len > 0 and !is_mentioned) continue;
+                    if (!is_mentioned) {
+                        if (debug) try stdout.print("[DEBUG] Not mentioned — skipping message.\n", .{});
+                        continue;
+                    }
 
-                    // Strip the @mention so the LLM gets clean input.
+                    // Strip the leading @mention token so the LLM gets clean input.
+                    // Handles <@BOT_ID>, <@!BOT_ID>, and <@&ROLE_ID> prefixes.
                     const content = blk: {
-                        if (is_mentioned) {
-                            var stripped = content_raw;
-                            if (std.mem.startsWith(u8, stripped, mention)) {
-                                stripped = std.mem.trim(u8, stripped[mention.len..], " \t");
+                        var stripped = content_raw;
+                        // Try to strip any leading mention token (user, nickname, or role).
+                        if (std.mem.startsWith(u8, stripped, mention)) {
+                            stripped = std.mem.trim(u8, stripped[mention.len..], " \t");
+                        } else if (std.mem.startsWith(u8, stripped, mention_nick)) {
+                            stripped = std.mem.trim(u8, stripped[mention_nick.len..], " \t");
+                        } else if (std.mem.startsWith(u8, stripped, "<@&")) {
+                            // Role mention: find the closing '>' and strip past it.
+                            if (std.mem.indexOf(u8, stripped, ">")) |end| {
+                                stripped = std.mem.trim(u8, stripped[end + 1..], " \t");
                             }
-                            break :blk stripped;
                         }
-                        break :blk content_raw;
+                        break :blk stripped;
                     };
                     if (content.len == 0) continue;
 
@@ -369,9 +550,9 @@ fn discordGatewayLoop(
                     try stdout.print("Discord [{s}] {s}: {s}\n", .{ channel_id, author_name, content });
                     try stdout.print("Discord: generating reply...\n", .{});
 
-                    const reply = any_provider.chatOnce(
-                        "You are BareClaw, a fast, bear-themed AI assistant.",
-                        content, cfg.default_model, 0.7,
+                    const reply = agent_mod.runAgentOnceCaptured(
+                        allocator, cfg, any_provider,
+                        memory, tools, policy, mcp_pool, content,
                     ) catch |err| blk: {
                         break :blk try std.fmt.allocPrint(allocator, "error: {}", .{err});
                     };
@@ -384,8 +565,12 @@ fn discordGatewayLoop(
                     try stdout.print("Discord: reply sent.\n", .{});
                 }
             },
-            11 => {},
-            else => {},
+            11 => {
+                if (debug) try stdout.print("[DEBUG] Heartbeat ACK received.\n", .{});
+            },
+            else => {
+                if (debug) try stdout.print("[DEBUG] Unknown op={d}, ignoring.\n", .{op});
+            },
         }
     }
 }
