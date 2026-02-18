@@ -119,7 +119,17 @@ pub fn main() !void {
         }
 
         if (server_defs.len > 0) {
-            mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+            // T1-5: Collect MCP startup errors and surface them to the user
+            // before starting the agent loop — don't silently drop failed servers.
+            var mcp_errors: []tools_mod.McpStartupError = &[_]tools_mod.McpStartupError{};
+            mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool, &mcp_errors);
+            defer {
+                for (mcp_errors) |*e| @constCast(e).deinit(allocator);
+                allocator.free(mcp_errors);
+            }
+            for (mcp_errors) |e| {
+                try stdout.print("⚠ MCP server '{s}' failed to start: {s}\n", .{ e.server_name, e.message });
+            }
             has_mcp = true;
             try all_tools.appendSlice(mcp_tools);
         }

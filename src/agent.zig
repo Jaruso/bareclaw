@@ -157,6 +157,58 @@ fn runAgentOnceToWriter(
     try out.print("(agent reached max tool-call rounds)\n", .{});
 }
 
+// ── T1-2: Context budget ──────────────────────────────────────────────────────
+// Maximum accumulated tool-result characters before we truncate oldest entries.
+// Keeps context well within typical model context windows.
+const MAX_CONTEXT_CHARS: usize = 12_000;
+// Exported for tests in root.zig.
+pub const MAX_CONTEXT_CHARS_EXPORTED: usize = MAX_CONTEXT_CHARS;
+
+// ── T1-1: Robust JSON extraction ─────────────────────────────────────────────
+//
+// Models frequently wrap their JSON in prose or markdown fences, e.g.:
+//   "Sure! Here is the tool call:\n```json\n{...}\n```"
+// This function strips fences and extracts the first top-level {...} block
+// so dispatchAllToolCalls() can parse it even when the model misbehaves.
+//
+// Returns a slice into `input` (no allocation). Returns null if no JSON
+// object is found.
+fn extractJsonObject(input: []const u8) ?[]const u8 {
+    // Strip markdown code fences (```json ... ``` or ``` ... ```).
+    var src = input;
+    if (std.mem.indexOf(u8, src, "```")) |fence_start| {
+        const after_fence = fence_start + 3;
+        // Skip optional language tag on the same line (e.g. "json\n").
+        const newline = std.mem.indexOfScalarPos(u8, src, after_fence, '\n') orelse after_fence;
+        const content_start = newline + 1;
+        if (std.mem.lastIndexOf(u8, src, "```")) |fence_end| {
+            if (fence_end > content_start) {
+                src = std.mem.trim(u8, src[content_start..fence_end], " \t\r\n");
+            }
+        }
+    }
+
+    // Find the first '{' and its matching '}'.
+    const obj_start = std.mem.indexOfScalar(u8, src, '{') orelse return null;
+    var depth: usize = 0;
+    var in_string = false;
+    var escape_next = false;
+    var i = obj_start;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape_next) { escape_next = false; continue; }
+        if (c == '\\' and in_string) { escape_next = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        if (in_string) continue;
+        if (c == '{') { depth += 1; }
+        else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return src[obj_start .. i + 1];
+        }
+    }
+    return null;
+}
+
 /// Parse all tool_calls from response_json, execute each one using a proper
 /// ToolContext (with real policy and memory), and append results to `context`.
 /// Returns true if at least one tool call was found and dispatched.
@@ -166,9 +218,12 @@ fn dispatchAllToolCalls(
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
     mcp_pool: ?*mcp_mod.McpSessionPool,
-    response_json: []const u8,
+    response_raw: []const u8,
     context: *std.ArrayList(u8),
 ) !bool {
+    // T1-1: Extract a JSON object from the response, tolerating prose wrapping.
+    const response_json = extractJsonObject(response_raw) orelse return false;
+
     // The response may be plain text (no JSON) – parse gracefully.
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{}) catch
         return false;
@@ -255,10 +310,31 @@ fn dispatchAllToolCalls(
 
             // Append result to context buffer.
             const status = if (result.success) "ok" else "error";
-            try context.writer().print(
+            const entry = try std.fmt.allocPrint(
+                allocator,
                 "[{s}] {s}: {s}\n",
                 .{ status, name, result.output },
             );
+            defer allocator.free(entry);
+
+            // T1-2: Enforce context budget. If adding this entry would exceed
+            // MAX_CONTEXT_CHARS, drop oldest entries (from the front) until it fits.
+            if (context.items.len + entry.len > MAX_CONTEXT_CHARS) {
+                const needed = (context.items.len + entry.len) -| MAX_CONTEXT_CHARS;
+                // Find a newline boundary so we don't cut mid-line.
+                const cut = if (std.mem.indexOfPos(u8, context.items, needed, "\n")) |nl|
+                    nl + 1
+                else
+                    @min(needed, context.items.len);
+                // Shift remaining content to the front.
+                const remaining = context.items.len - cut;
+                std.mem.copyForwards(u8, context.items[0..remaining], context.items[cut..]);
+                context.shrinkRetainingCapacity(remaining);
+                // Prepend a truncation marker so the model knows history was dropped.
+                const marker = "[... earlier tool results truncated due to context budget ...]\n";
+                try context.insertSlice(0, marker);
+            }
+            try context.appendSlice(entry);
 
             break;
         }

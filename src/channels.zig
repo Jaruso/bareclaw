@@ -101,7 +101,15 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     }
 
     if (server_defs.len > 0) {
-        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        var mcp_errors: []tools_mod.McpStartupError = &[_]tools_mod.McpStartupError{};
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool, &mcp_errors);
+        defer {
+            for (mcp_errors) |*e| @constCast(e).deinit(allocator);
+            allocator.free(mcp_errors);
+        }
+        for (mcp_errors) |e| {
+            std.debug.print("⚠ MCP server '{s}' failed to start: {s}\n", .{ e.server_name, e.message });
+        }
         has_mcp = true;
     }
     defer if (has_mcp) {
@@ -196,7 +204,15 @@ pub fn runDiscordChannel(cfg: *const config_mod.Config, debug: bool) !void {
     }
 
     if (server_defs.len > 0) {
-        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        var mcp_errors: []tools_mod.McpStartupError = &[_]tools_mod.McpStartupError{};
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool, &mcp_errors);
+        defer {
+            for (mcp_errors) |*e| @constCast(e).deinit(allocator);
+            allocator.free(mcp_errors);
+        }
+        for (mcp_errors) |e| {
+            try stdout.print("⚠ MCP server '{s}' failed to start: {s}\n", .{ e.server_name, e.message });
+        }
         has_mcp = true;
         try stdout.print("Discord: loaded {d} MCP tool(s)\n", .{mcp_tools.len});
     }

@@ -112,20 +112,10 @@ pub const SecurityPolicy = struct {
     }
 };
 
-pub const SecretStore = struct {
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) SecretStore {
-        return SecretStore{ .allocator = allocator };
-    }
-
-    pub fn saveApiKey(self: *SecretStore, name: []const u8, value: []const u8) !void {
-        var path = std.ArrayList(u8).init(self.allocator);
-        defer path.deinit();
-        try path.writer().print("{s}/.bareclaw/secrets-{s}.txt", .{ try std.process.getEnvVarOwned(self.allocator, "HOME"), name });
-        var file = try std.fs.cwd().createFile(path.items, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(value);
-    }
-};
+// T1-4: SecretStore removed.
+// It wrote API keys as plaintext files with no file-permission enforcement
+// and no encryption. It was never wired to any command path, but was dangerous
+// to activate in that state. If a secrets backend is needed in the future,
+// enforce 0o600 permissions at minimum and warn the user about plaintext storage,
+// or integrate with OS keychain APIs.
 
