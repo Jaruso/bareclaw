@@ -125,6 +125,10 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
 
     try stdout.print("BareClaw interactive CLI – type 'exit' to quit.\n", .{});
 
+    // T2-1: Initialise conversation history for this session.
+    var history = agent_mod.ConversationHistory.init(allocator);
+    defer history.deinit();
+
     var buf: [4096]u8 = undefined;
     while (true) {
         try stdout.print("> ", .{});
@@ -134,11 +138,14 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) break;
 
-        agent_mod.runAgentOnce(
+        // T2-1: Use history-aware agent call so each turn sees prior context.
+        agent_mod.runAgentWithHistory(
             allocator, cfg, any_provider,
             &stack.mem_backend, all_tools.items, &stack.policy,
             if (has_mcp) &mcp_pool else null,
             trimmed,
+            &history,
+            &stdout,
         ) catch |err| {
             try stdout.print("agent error: {}\n", .{err});
         };

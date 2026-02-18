@@ -362,6 +362,174 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     };
 }
 
+// ── T2-6: memory_list_keys ───────────────────────────────────────────────────
+
+fn toolMemoryListKeys(ctx: *ToolContext, _: []const u8) !ToolResult {
+    ctx.policy.auditLog("memory_list_keys", "") catch {};
+
+    const mem_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.policy.workspace_dir, "memory" });
+    defer ctx.allocator.free(mem_dir);
+
+    var dir = std.fs.cwd().openDir(mem_dir, .{ .iterate = true }) catch {
+        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no memory directory yet)") };
+    };
+    defer dir.close();
+
+    var out = std.ArrayList(u8).init(ctx.allocator);
+    errdefer out.deinit();
+
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        // Strip ".md" suffix to show the logical key name.
+        const name = if (std.mem.endsWith(u8, entry.name, ".md"))
+            entry.name[0 .. entry.name.len - 3]
+        else
+            entry.name;
+        try out.writer().print("{s}\n", .{name});
+        count += 1;
+    }
+
+    if (count == 0) {
+        out.deinit();
+        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no memory entries)") };
+    }
+    return ToolResult{ .success = true, .output = try out.toOwnedSlice() };
+}
+
+// ── T2-6: memory_delete_prefix ───────────────────────────────────────────────
+
+fn toolMemoryDeletePrefix(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult{ .success = false, .output = "invalid JSON in memory_delete_prefix args" };
+    };
+    defer parsed.deinit();
+
+    const prefix = getString(parsed.value, "prefix") orelse {
+        return ToolResult{ .success = false, .output = "memory_delete_prefix: missing 'prefix' argument" };
+    };
+
+    ctx.policy.auditLog("memory_delete_prefix", prefix) catch {};
+
+    const mem_dir_path = try std.fs.path.join(ctx.allocator, &.{ ctx.policy.workspace_dir, "memory" });
+    defer ctx.allocator.free(mem_dir_path);
+
+    var dir = std.fs.cwd().openDir(mem_dir_path, .{ .iterate = true }) catch {
+        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "deleted 0 entries") };
+    };
+    defer dir.close();
+
+    var deleted: usize = 0;
+    var it = dir.iterate();
+    // Collect matching names first (can't delete while iterating).
+    var to_delete = std.ArrayList([]u8).init(ctx.allocator);
+    defer {
+        for (to_delete.items) |name| ctx.allocator.free(name);
+        to_delete.deinit();
+    }
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const key = if (std.mem.endsWith(u8, entry.name, ".md"))
+            entry.name[0 .. entry.name.len - 3]
+        else
+            entry.name;
+        if (std.mem.startsWith(u8, key, prefix)) {
+            try to_delete.append(try ctx.allocator.dupe(u8, entry.name));
+        }
+    }
+    for (to_delete.items) |name| {
+        dir.deleteFile(name) catch continue;
+        deleted += 1;
+    }
+
+    const msg = try std.fmt.allocPrint(ctx.allocator, "deleted {d} memory entries with prefix '{s}'", .{ deleted, prefix });
+    return ToolResult{ .success = true, .output = msg };
+}
+
+// ── T2-7: agent_status ───────────────────────────────────────────────────────
+
+fn toolAgentStatus(ctx: *ToolContext, _: []const u8) !ToolResult {
+    ctx.policy.auditLog("agent_status", "") catch {};
+
+    // Count memory files.
+    const mem_dir_path = try std.fs.path.join(ctx.allocator, &.{ ctx.policy.workspace_dir, "memory" });
+    defer ctx.allocator.free(mem_dir_path);
+
+    var mem_count: usize = 0;
+    if (std.fs.cwd().openDir(mem_dir_path, .{ .iterate = true })) |d| {
+        var dir = d;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind == .file) mem_count += 1;
+        }
+    } else |_| {}
+
+    const out = try std.fmt.allocPrint(
+        ctx.allocator,
+        "workspace: {s}\nmemory_entries: {d}\npolicy: workspace-only sandbox",
+        .{ ctx.policy.workspace_dir, mem_count },
+    );
+    return ToolResult{ .success = true, .output = out };
+}
+
+// ── T2-7: audit_log_read ─────────────────────────────────────────────────────
+
+fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult{ .success = false, .output = "invalid JSON in audit_log_read args" };
+    };
+    defer parsed.deinit();
+
+    // Optional: {"n": 20} — default to last 50 lines.
+    var n: usize = 50;
+    if (parsed.value.object.get("n")) |nv| {
+        n = switch (nv) {
+            .integer => |i| @intCast(@max(1, i)),
+            else => 50,
+        };
+    }
+
+    ctx.policy.auditLog("audit_log_read", "") catch {};
+
+    const log_path = try std.fs.path.join(ctx.allocator, &.{ ctx.policy.workspace_dir, "audit.log" });
+    defer ctx.allocator.free(log_path);
+
+    const file = std.fs.cwd().openFile(log_path, .{}) catch {
+        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(audit log empty or not yet created)") };
+    };
+    defer file.close();
+
+    const raw = file.readToEndAlloc(ctx.allocator, 4 * 1024 * 1024) catch {
+        return ToolResult{ .success = false, .output = try ctx.allocator.dupe(u8, "audit_log_read: read error") };
+    };
+    defer ctx.allocator.free(raw);
+
+    // Return last `n` lines.
+    var lines = std.ArrayList([]const u8).init(ctx.allocator);
+    defer lines.deinit();
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try lines.append(line);
+    }
+
+    const start = if (lines.items.len > n) lines.items.len - n else 0;
+    var out = std.ArrayList(u8).init(ctx.allocator);
+    errdefer out.deinit();
+    for (lines.items[start..]) |line| {
+        try out.appendSlice(line);
+        try out.append('\n');
+    }
+
+    if (out.items.len == 0) {
+        out.deinit();
+        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no audit entries)") };
+    }
+    return ToolResult{ .success = true, .output = try capOutput(ctx.allocator, out.items) };
+}
+
 // ── registry ──────────────────────────────────────────────────────────────────
 
 pub fn buildCoreTools(
@@ -372,14 +540,18 @@ pub fn buildCoreTools(
     var list = std.ArrayList(Tool).init(allocator);
     errdefer list.deinit();
 
-    try list.append(Tool{ .name = "shell",            .executeFn = toolShell });
-    try list.append(Tool{ .name = "file_read",        .executeFn = toolFileRead });
-    try list.append(Tool{ .name = "file_write",       .executeFn = toolFileWrite });
-    try list.append(Tool{ .name = "memory_store",     .executeFn = toolMemoryStore });
-    try list.append(Tool{ .name = "memory_recall",    .executeFn = toolMemoryRecall });
-    try list.append(Tool{ .name = "memory_forget",    .executeFn = toolMemoryForget });
-    try list.append(Tool{ .name = "http_request",     .executeFn = toolHttpRequest });
-    try list.append(Tool{ .name = "git_operations",   .executeFn = toolGitOperations });
+    try list.append(Tool{ .name = "shell",                .description = "Run a shell command",                                    .executeFn = toolShell });
+    try list.append(Tool{ .name = "file_read",            .description = "Read a file from the workspace",                        .executeFn = toolFileRead });
+    try list.append(Tool{ .name = "file_write",           .description = "Write content to a file in the workspace",              .executeFn = toolFileWrite });
+    try list.append(Tool{ .name = "memory_store",         .description = "Store a value in memory by key",                       .executeFn = toolMemoryStore });
+    try list.append(Tool{ .name = "memory_recall",        .description = "Recall a stored memory entry by key",                  .executeFn = toolMemoryRecall });
+    try list.append(Tool{ .name = "memory_forget",        .description = "Delete a stored memory entry by key",                  .executeFn = toolMemoryForget });
+    try list.append(Tool{ .name = "memory_list_keys",     .description = "List all memory entry keys",                           .executeFn = toolMemoryListKeys });
+    try list.append(Tool{ .name = "memory_delete_prefix", .description = "Delete all memory entries whose key starts with prefix",.executeFn = toolMemoryDeletePrefix });
+    try list.append(Tool{ .name = "http_request",         .description = "Make a GET or POST HTTP request",                      .executeFn = toolHttpRequest });
+    try list.append(Tool{ .name = "git_operations",       .description = "Run a git subcommand in the workspace",                 .executeFn = toolGitOperations });
+    try list.append(Tool{ .name = "agent_status",         .description = "Return agent runtime status (workspace, memory count)", .executeFn = toolAgentStatus });
+    try list.append(Tool{ .name = "audit_log_read",       .description = "Read the last N lines of the audit log",               .executeFn = toolAuditLogRead });
 
     return list.toOwnedSlice();
 }

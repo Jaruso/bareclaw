@@ -10,6 +10,132 @@ const mcp_mod = @import("mcp_client.zig");
 /// return the last assistant message. Prevents runaway loops.
 const MAX_TOOL_ROUNDS: usize = 8;
 
+// ── T2-1: Conversation history ────────────────────────────────────────────────
+//
+// ConversationHistory accumulates user/assistant turns across multiple calls
+// so the model sees prior context in channel loop mode.
+//
+// Usage:
+//   var history = ConversationHistory.init(allocator);
+//   defer history.deinit();
+//   try runAgentWithHistory(allocator, cfg, provider, memory, tools, policy,
+//                           mcp_pool, "hello", &history, &writer);
+//   // history now contains the user + assistant turn above
+//   try runAgentWithHistory(..., "follow up question", &history, &writer);
+
+pub const MessageRole = enum { user, assistant };
+
+pub const Message = struct {
+    role:    MessageRole,
+    content: []const u8, // owned
+
+    pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        self.* = undefined;
+    }
+};
+
+/// Owned, growable conversation history. Pass a pointer to one of these to
+/// runAgentWithHistory() to maintain state across turns.
+pub const ConversationHistory = struct {
+    allocator: std.mem.Allocator,
+    messages:  std.ArrayList(Message),
+
+    pub fn init(allocator: std.mem.Allocator) ConversationHistory {
+        return .{
+            .allocator = allocator,
+            .messages  = std.ArrayList(Message).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ConversationHistory) void {
+        for (self.messages.items) |*m| m.deinit(self.allocator);
+        self.messages.deinit();
+    }
+
+    pub fn append(self: *ConversationHistory, role: MessageRole, content: []const u8) !void {
+        try self.messages.append(Message{
+            .role    = role,
+            .content = try self.allocator.dupe(u8, content),
+        });
+    }
+
+    /// Estimate total character count (for context budget enforcement).
+    pub fn totalChars(self: *const ConversationHistory) usize {
+        var total: usize = 0;
+        for (self.messages.items) |m| total += m.content.len;
+        return total;
+    }
+
+    /// Drop oldest messages until totalChars <= max_chars.
+    /// Always keeps at least the most recent user turn.
+    pub fn trim(self: *ConversationHistory, max_chars: usize) void {
+        while (self.messages.items.len > 1 and self.totalChars() > max_chars) {
+            var oldest = self.messages.orderedRemove(0);
+            oldest.deinit(self.allocator);
+        }
+    }
+};
+
+/// Run one agent turn with persistent conversation history.
+/// Appends the user message and assistant reply to `history`.
+/// The writer receives the final reply text.
+pub fn runAgentWithHistory(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    provider: provider_mod.AnyProvider,
+    memory: *memory_mod.MemoryBackend,
+    tools: []const tools_mod.Tool,
+    policy: *security_mod.SecurityPolicy,
+    mcp_pool: ?*mcp_mod.McpSessionPool,
+    user_message: []const u8,
+    history: *ConversationHistory,
+    out: anytype,
+) !void {
+    // Append the user message to history before calling the provider.
+    try history.append(.user, user_message);
+
+    // Enforce context budget on history (keep it within MAX_CONTEXT_CHARS).
+    history.trim(MAX_CONTEXT_CHARS);
+
+    // Build history-aware user message: prepend prior turns as a transcript.
+    var effective_user_buf = std.ArrayList(u8).init(allocator);
+    defer effective_user_buf.deinit();
+    const ew = effective_user_buf.writer();
+
+    // Include all prior turns except the one we just appended (the current user message).
+    const prior_count = if (history.messages.items.len > 1) history.messages.items.len - 1 else 0;
+    if (prior_count > 0) {
+        try ew.writeAll("[Conversation history]\n");
+        for (history.messages.items[0..prior_count]) |msg| {
+            const role_str = if (msg.role == .user) "User" else "Assistant";
+            try ew.print("{s}: {s}\n", .{ role_str, msg.content });
+        }
+        try ew.writeAll("[End of history]\n\n");
+        try ew.writeAll(user_message);
+    } else {
+        try ew.writeAll(user_message);
+    }
+
+    // Capture the reply so we can store it in history.
+    var reply_buf = std.ArrayList(u8).init(allocator);
+    defer reply_buf.deinit();
+    var reply_writer = reply_buf.writer();
+
+    try runAgentOnceToWriter(
+        allocator, cfg, provider, memory, tools, policy, mcp_pool,
+        effective_user_buf.items, &reply_writer,
+    );
+
+    const reply = reply_buf.items;
+
+    // Store assistant reply in history.
+    try history.append(.assistant, reply);
+
+    // Forward to the real output writer.
+    try out.writeAll(reply);
+}
+
 pub fn runAgentOnce(
     allocator: std.mem.Allocator,
     cfg: *const config_mod.Config,
@@ -304,9 +430,11 @@ fn dispatchAllToolCalls(
 
             const result = tool.executeFn(&ctx, args_json) catch |err| blk: {
                 const msg = try std.fmt.allocPrint(allocator, "tool error: {}", .{err});
-                defer allocator.free(msg);
                 break :blk tools_mod.ToolResult{ .success = false, .output = msg };
             };
+            // result.output is always an owned allocation from the tool (or the
+            // error branch above). Free it once we've formatted the context entry.
+            defer allocator.free(result.output);
 
             // Append result to context buffer.
             const status = if (result.success) "ok" else "error";
