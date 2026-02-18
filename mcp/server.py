@@ -402,6 +402,94 @@ def doctor() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cron management tools (T2-3)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def cron_list() -> str:
+    """List all configured cron tasks with schedule, status, and time until next run."""
+    result = _run([str(BINARY), "cron", "list"])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_add(schedule: str, command: str) -> str:
+    """Add a new cron task.
+
+    Args:
+        schedule: Cron expression. Supports @hourly @daily @weekly @monthly,
+                  or standard 5-field format (e.g. "0 * * * *" for hourly,
+                  "*/15 * * * *" for every 15 minutes).
+        command:  Shell command to run when the task fires.
+    """
+    result = _run([str(BINARY), "cron", "add", schedule, command])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_remove(task_id: str) -> str:
+    """Remove a cron task by ID (e.g. "t1").
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "remove", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_pause(task_id: str) -> str:
+    """Pause a cron task (keep it but stop it from firing).
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "pause", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_resume(task_id: str) -> str:
+    """Resume a paused cron task.
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "resume", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_add_prompt(schedule: str, prompt: str) -> str:
+    """Add a new agent-prompt cron task.
+
+    When the task fires, BareClaw runs the agent with the given prompt instead
+    of a shell command. The agent response is stored in memory under
+    "cron/<task_id>/<timestamp>" for later recall.
+
+    Args:
+        schedule: Cron expression. Supports @hourly @daily @weekly @monthly,
+                  or standard 5-field format (e.g. "0 9 * * *" for 9am daily).
+        prompt:   The agent prompt to send when the task fires.
+    """
+    result = _run([str(BINARY), "cron", "add-prompt", schedule, prompt])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_run() -> str:
+    """Execute all cron tasks that are currently due.
+
+    Tasks whose next_run timestamp has passed are executed and their next_run
+    is advanced to the following scheduled time. Tasks not yet due are skipped.
+    Prompt tasks call the agent; shell tasks exec the command.
+    """
+    result = _run([str(BINARY), "cron", "run"], timeout=60)
+    return _format(result)
+
+
+# ---------------------------------------------------------------------------
 # MCP server management tools
 # ---------------------------------------------------------------------------
 

@@ -75,6 +75,24 @@ pub const ConversationHistory = struct {
             oldest.deinit(self.allocator);
         }
     }
+
+    /// Build a markdown transcript of all messages.
+    /// Caller owns the returned slice — free with allocator.free().
+    pub fn toTranscript(self: *const ConversationHistory, allocator: std.mem.Allocator) ![]u8 {
+        var buf = std.ArrayList(u8).init(allocator);
+        errdefer buf.deinit();
+        for (self.messages.items) |m| {
+            const label: []const u8 = switch (m.role) {
+                .user      => "**User:**",
+                .assistant => "**Assistant:**",
+            };
+            try buf.appendSlice(label);
+            try buf.appendSlice("\n\n");
+            try buf.appendSlice(m.content);
+            try buf.appendSlice("\n\n---\n\n");
+        }
+        return buf.toOwnedSlice();
+    }
 };
 
 /// Run one agent turn with persistent conversation history.

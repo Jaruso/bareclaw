@@ -150,6 +150,29 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
             try stdout.print("agent error: {}\n", .{err});
         };
     }
+
+    // T2-2: Store session transcript in memory when the session ends.
+    // Only bother if there were actual messages exchanged.
+    if (history.messages.items.len > 0) {
+        const transcript = history.toTranscript(allocator) catch null;
+        if (transcript) |t| {
+            defer allocator.free(t);
+            const ts = std.time.timestamp();
+            const bt = @import("cron.zig").timestampToBroken(ts);
+            const mem_key = std.fmt.allocPrint(
+                allocator,
+                "session/{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}",
+                .{ bt.year, bt.month, bt.day, bt.hour, bt.minute },
+            ) catch null;
+            if (mem_key) |k| {
+                defer allocator.free(k);
+                stack.mem_backend.store(k, t) catch |err| {
+                    // Non-fatal — don't propagate storage errors to the user.
+                    std.debug.print("session transcript store failed: {}\n", .{err});
+                };
+            }
+        }
+    }
 }
 
 // ── Discord channel ───────────────────────────────────────────────────────────

@@ -211,3 +211,86 @@ test "buildCoreTools: all expected tools are present" {
     }
     try std.testing.expectEqual(expected_tools.len, tool_list.len);
 }
+
+// ── T2-3: Cron expression parser unit tests ───────────────────────────────────
+
+test "cron: parseCronExpr rejects garbage" {
+    const cron_mod = @import("cron.zig");
+    try std.testing.expectError(error.InvalidCronExpr, cron_mod.parseCronExpr("not-a-cron"));
+    try std.testing.expectError(error.InvalidCronExpr, cron_mod.parseCronExpr("* * * *")); // only 4 fields
+    try std.testing.expectError(error.InvalidCronExpr, cron_mod.parseCronExpr("*/0 * * * *")); // step of 0
+}
+
+test "cron: parseCronExpr accepts @ aliases" {
+    const cron_mod = @import("cron.zig");
+    // @daily should parse without error.
+    const expr = try cron_mod.parseCronExpr("@daily");
+    // @daily = "0 0 * * *" → minute=exact(0), hour=exact(0), others=any
+    switch (expr.minute) {
+        .exact => |v| try std.testing.expectEqual(@as(u32, 0), v),
+        else   => try std.testing.expect(false),
+    }
+    switch (expr.hour) {
+        .exact => |v| try std.testing.expectEqual(@as(u32, 0), v),
+        else   => try std.testing.expect(false),
+    }
+    switch (expr.dom) {
+        .any => {},
+        else => try std.testing.expect(false),
+    }
+}
+
+test "cron: parseCronExpr accepts every-N syntax" {
+    const cron_mod = @import("cron.zig");
+    const expr = try cron_mod.parseCronExpr("*/15 */6 * * *");
+    switch (expr.minute) {
+        .every => |n| try std.testing.expectEqual(@as(u32, 15), n),
+        else   => try std.testing.expect(false),
+    }
+    switch (expr.hour) {
+        .every => |n| try std.testing.expectEqual(@as(u32, 6), n),
+        else   => try std.testing.expect(false),
+    }
+}
+
+test "cron: timestampToBroken round-trips a known date" {
+    const cron_mod = @import("cron.zig");
+    // 2024-01-15 09:30:00 UTC = 1705311000
+    const ts: i64 = 1705311000;
+    const bt = cron_mod.timestampToBroken(ts);
+    try std.testing.expectEqual(@as(u32, 2024), bt.year);
+    try std.testing.expectEqual(@as(u32, 1),    bt.month);
+    try std.testing.expectEqual(@as(u32, 15),   bt.day);
+    try std.testing.expectEqual(@as(u32, 9),    bt.hour);
+    try std.testing.expectEqual(@as(u32, 30),   bt.minute);
+}
+
+test "cron: nextRunAfter advances by at least 60s" {
+    const cron_mod = @import("cron.zig");
+    // "* * * * *" should fire every minute.
+    const expr = try cron_mod.parseCronExpr("* * * * *");
+    const now: i64 = 1705311000;
+    const next = cron_mod.nextRunAfter(expr, now);
+    try std.testing.expect(next > now);
+    try std.testing.expect(next >= now + 60);
+    // And it should be at most 2 minutes away.
+    try std.testing.expect(next <= now + 120);
+}
+
+test "cron: nextRunAfter for @hourly fires within 1 hour" {
+    const cron_mod = @import("cron.zig");
+    const expr = try cron_mod.parseCronExpr("@hourly");
+    const now: i64 = 1705311000;
+    const next = cron_mod.nextRunAfter(expr, now);
+    try std.testing.expect(next > now);
+    try std.testing.expect(next <= now + 3600);
+}
+
+test "cron: nextRunAfter for @daily fires within 24 hours" {
+    const cron_mod = @import("cron.zig");
+    const expr = try cron_mod.parseCronExpr("@daily");
+    const now: i64 = 1705311000;
+    const next = cron_mod.nextRunAfter(expr, now);
+    try std.testing.expect(next > now);
+    try std.testing.expect(next <= now + 86400);
+}
