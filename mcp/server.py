@@ -317,6 +317,179 @@ def workspace_contents() -> str:
 
 
 # ---------------------------------------------------------------------------
+# T2-6/T2-7: Agent introspection and memory management tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def agent_status() -> str:
+    """Return agent runtime status: workspace path, memory entry count, policy.
+
+    Calls the built-in agent_status tool via a single-turn agent run.
+    Useful for checking the health of the agent's working state.
+    """
+    result = _run([str(BINARY), "mcp", "call", "bareclaw", "agent_status"], timeout=15)
+    # Fallback: call via bareclaw agent (single-turn) if mcp call not available
+    if not result["ok"]:
+        result = _run([str(BINARY), "agent", "call agent_status tool and show the result"], timeout=30)
+    return _format(result)
+
+
+@mcp.tool()
+def audit_log_read(n: int = 50) -> str:
+    """Read the last N lines of the BareClaw audit log.
+
+    The audit log records every tool call with a unix timestamp, tool name,
+    and detail string. Useful for debugging what the agent did.
+
+    Args:
+        n: Number of lines to return (default: 50).
+    """
+    audit_path = Path.home() / ".bareclaw" / "workspace" / "audit.log"
+    if not audit_path.exists():
+        return "(audit log not yet created)"
+    lines = audit_path.read_text().splitlines()
+    tail = lines[-n:] if len(lines) > n else lines
+    return "\n".join(tail) if tail else "(audit log is empty)"
+
+
+@mcp.tool()
+def memory_list_keys() -> str:
+    """List all keys stored in BareClaw's memory backend.
+
+    Returns the logical key name (filename without .md extension) for each
+    memory entry stored in ~/.bareclaw/workspace/memory/.
+    """
+    memory_dir = Path.home() / ".bareclaw" / "workspace" / "memory"
+    if not memory_dir.exists():
+        return "(no memory directory yet)"
+    keys = sorted(
+        f.stem for f in memory_dir.glob("*.md") if f.is_file()
+    )
+    if not keys:
+        return "(no memory entries)"
+    return "\n".join(keys)
+
+
+@mcp.tool()
+def memory_delete_prefix(prefix: str) -> str:
+    """Delete all memory entries whose key starts with the given prefix.
+
+    Useful for cleaning up session transcripts or bulk-removing related entries.
+
+    Args:
+        prefix: Key prefix to match (e.g. "session/" deletes all session entries).
+    """
+    memory_dir = Path.home() / ".bareclaw" / "workspace" / "memory"
+    if not memory_dir.exists():
+        return f"deleted 0 entries (no memory directory)"
+    deleted = 0
+    for f in list(memory_dir.glob("*.md")):
+        if f.stem.startswith(prefix):
+            f.unlink()
+            deleted += 1
+    return f"deleted {deleted} memory entries with prefix '{prefix}'"
+
+
+@mcp.tool()
+def doctor() -> str:
+    """Run `bareclaw doctor` to check health of all subsystems.
+
+    Checks workspace writability, config file, API key, audit log, and cron tasks.
+    """
+    result = _run([str(BINARY), "doctor"])
+    return _format(result)
+
+
+# ---------------------------------------------------------------------------
+# Cron management tools (T2-3)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def cron_list() -> str:
+    """List all configured cron tasks with schedule, status, and time until next run."""
+    result = _run([str(BINARY), "cron", "list"])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_add(schedule: str, command: str) -> str:
+    """Add a new cron task.
+
+    Args:
+        schedule: Cron expression. Supports @hourly @daily @weekly @monthly,
+                  or standard 5-field format (e.g. "0 * * * *" for hourly,
+                  "*/15 * * * *" for every 15 minutes).
+        command:  Shell command to run when the task fires.
+    """
+    result = _run([str(BINARY), "cron", "add", schedule, command])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_remove(task_id: str) -> str:
+    """Remove a cron task by ID (e.g. "t1").
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "remove", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_pause(task_id: str) -> str:
+    """Pause a cron task (keep it but stop it from firing).
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "pause", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_resume(task_id: str) -> str:
+    """Resume a paused cron task.
+
+    Args:
+        task_id: The task ID shown in cron_list().
+    """
+    result = _run([str(BINARY), "cron", "resume", task_id])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_add_prompt(schedule: str, prompt: str) -> str:
+    """Add a new agent-prompt cron task.
+
+    When the task fires, BareClaw runs the agent with the given prompt instead
+    of a shell command. The agent response is stored in memory under
+    "cron/<task_id>/<timestamp>" for later recall.
+
+    Args:
+        schedule: Cron expression. Supports @hourly @daily @weekly @monthly,
+                  or standard 5-field format (e.g. "0 9 * * *" for 9am daily).
+        prompt:   The agent prompt to send when the task fires.
+    """
+    result = _run([str(BINARY), "cron", "add-prompt", schedule, prompt])
+    return _format(result)
+
+
+@mcp.tool()
+def cron_run() -> str:
+    """Execute all cron tasks that are currently due.
+
+    Tasks whose next_run timestamp has passed are executed and their next_run
+    is advanced to the following scheduled time. Tasks not yet due are skipped.
+    Prompt tasks call the agent; shell tasks exec the command.
+    """
+    result = _run([str(BINARY), "cron", "run"], timeout=60)
+    return _format(result)
+
+
+# ---------------------------------------------------------------------------
 # MCP server management tools
 # ---------------------------------------------------------------------------
 

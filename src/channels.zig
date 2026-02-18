@@ -101,7 +101,15 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     }
 
     if (server_defs.len > 0) {
-        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        var mcp_errors: []tools_mod.McpStartupError = &[_]tools_mod.McpStartupError{};
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool, &mcp_errors);
+        defer {
+            for (mcp_errors) |*e| @constCast(e).deinit(allocator);
+            allocator.free(mcp_errors);
+        }
+        for (mcp_errors) |e| {
+            std.debug.print("⚠ MCP server '{s}' failed to start: {s}\n", .{ e.server_name, e.message });
+        }
         has_mcp = true;
     }
     defer if (has_mcp) {
@@ -117,6 +125,10 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
 
     try stdout.print("BareClaw interactive CLI – type 'exit' to quit.\n", .{});
 
+    // T2-1: Initialise conversation history for this session.
+    var history = agent_mod.ConversationHistory.init(allocator);
+    defer history.deinit();
+
     var buf: [4096]u8 = undefined;
     while (true) {
         try stdout.print("> ", .{});
@@ -126,14 +138,40 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) break;
 
-        agent_mod.runAgentOnce(
+        // T2-1: Use history-aware agent call so each turn sees prior context.
+        agent_mod.runAgentWithHistory(
             allocator, cfg, any_provider,
             &stack.mem_backend, all_tools.items, &stack.policy,
             if (has_mcp) &mcp_pool else null,
             trimmed,
+            &history,
+            &stdout,
         ) catch |err| {
             try stdout.print("agent error: {}\n", .{err});
         };
+    }
+
+    // T2-2: Store session transcript in memory when the session ends.
+    // Only bother if there were actual messages exchanged.
+    if (history.messages.items.len > 0) {
+        const transcript = history.toTranscript(allocator) catch null;
+        if (transcript) |t| {
+            defer allocator.free(t);
+            const ts = std.time.timestamp();
+            const bt = @import("cron.zig").timestampToBroken(ts);
+            const mem_key = std.fmt.allocPrint(
+                allocator,
+                "session/{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}",
+                .{ bt.year, bt.month, bt.day, bt.hour, bt.minute },
+            ) catch null;
+            if (mem_key) |k| {
+                defer allocator.free(k);
+                stack.mem_backend.store(k, t) catch |err| {
+                    // Non-fatal — don't propagate storage errors to the user.
+                    std.debug.print("session transcript store failed: {}\n", .{err});
+                };
+            }
+        }
     }
 }
 
@@ -196,7 +234,15 @@ pub fn runDiscordChannel(cfg: *const config_mod.Config, debug: bool) !void {
     }
 
     if (server_defs.len > 0) {
-        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool);
+        var mcp_errors: []tools_mod.McpStartupError = &[_]tools_mod.McpStartupError{};
+        mcp_tools = try tools_mod.buildMcpTools(allocator, server_defs, &mcp_pool, &mcp_errors);
+        defer {
+            for (mcp_errors) |*e| @constCast(e).deinit(allocator);
+            allocator.free(mcp_errors);
+        }
+        for (mcp_errors) |e| {
+            try stdout.print("⚠ MCP server '{s}' failed to start: {s}\n", .{ e.server_name, e.message });
+        }
         has_mcp = true;
         try stdout.print("Discord: loaded {d} MCP tool(s)\n", .{mcp_tools.len});
     }

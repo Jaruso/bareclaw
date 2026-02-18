@@ -112,13 +112,12 @@ fn storeMarkdown(self: *MemoryBackend, key: []const u8, content: []const u8) !vo
     try path_buf.appendSlice(".md");
 
     var cwd = std.fs.cwd();
-    // Ensure the memory subdirectory exists.
-    var mem_dir_buf = std.ArrayList(u8).init(self.allocator);
-    defer mem_dir_buf.deinit();
-    try mem_dir_buf.appendSlice(self.workspace_dir);
-    try mem_dir_buf.append(std.fs.path.sep);
-    try mem_dir_buf.appendSlice("memory");
-    cwd.makePath(mem_dir_buf.items) catch {};
+    // Ensure the full parent directory chain exists.
+    // This handles nested keys like "cron/t1/1700000000" which require
+    // memory/cron/t1/ to exist before the file can be created.
+    if (std.fs.path.dirname(path_buf.items)) |parent| {
+        cwd.makePath(parent) catch {};
+    }
 
     var file = try cwd.createFile(path_buf.items, .{ .truncate = true, .read = false });
     defer file.close();
